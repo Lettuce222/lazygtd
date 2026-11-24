@@ -1,10 +1,14 @@
 mod agent;
+mod approval_server;
 mod cli;
 mod db_file;
 mod local_files;
 mod planning;
+mod pr_watch;
 mod questions;
 mod render;
+mod review_agent;
+mod sessions;
 mod store;
 mod talk;
 
@@ -71,6 +75,7 @@ enum Mode {
     Steps(i64, usize),
     StepInput(i64, usize, bool, String),
     Question(i64),
+    LiveReview,
     QuestionText(i64, bool, String),
     SendConfirm(Item, String),
     Artifacts,
@@ -93,6 +98,11 @@ struct Desk {
     questions: Vec<questions::Question>,
     profile_path: Option<PathBuf>,
     agent_config: Option<agent::Config>,
+    pr_watcher: Option<pr_watch::Watcher>,
+    review_settings: Option<review_agent::Settings>,
+    live_review: Option<review_agent::Notice>,
+    review_rx: Option<mpsc::Receiver<review_agent::Notice>>,
+    note_visible: bool,
     outgoing: Option<mpsc::Receiver<String>>,
     can_confirm: bool,
     edit_request: Option<Item>,
@@ -125,6 +135,11 @@ impl Desk {
             questions: Vec::new(),
             profile_path: None,
             agent_config: None,
+            pr_watcher: None,
+            review_settings: None,
+            live_review: None,
+            review_rx: None,
+            note_visible: false,
             outgoing: None,
             can_confirm: false,
             edit_request: None,
@@ -310,6 +325,28 @@ impl Desk {
             return false;
         }
         match &mut self.mode {
+            Mode::LiveReview => {
+                use approval_server::ReviewDecision::*;
+                let value = match key.code {
+                    KeyCode::Char('y') if self.note_visible => Some(AllowNote),
+                    KeyCode::Char('n') | KeyCode::Esc => Some(Deny),
+                    KeyCode::Char('c') => Some(CancelTurn),
+                    _ => None,
+                };
+                if let Some(value) = value {
+                    let sent = self
+                        .live_review
+                        .take()
+                        .is_some_and(|notice| notice.decide(value));
+                    self.status = if sent {
+                        "今回の要求への判断を送信します".into()
+                    } else {
+                        "要求は失効しました".into()
+                    };
+                    self.note_visible = false;
+                    self.mode = Mode::Desk;
+                }
+            }
             Mode::Artifacts => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                     self.mode = Mode::Desk;
@@ -668,7 +705,10 @@ impl Desk {
                     }
                 }
                 KeyCode::Char('!') => {
-                    if let Some(q) = self.questions.first() {
+                    if self.live_review.is_some() {
+                        self.note_visible = false;
+                        self.mode = Mode::LiveReview;
+                    } else if let Some(q) = self.questions.first() {
                         self.question_scroll = 0;
                         self.question_end = u16::MAX;
                         self.mode = Mode::Question(q.id);
@@ -848,14 +888,22 @@ impl Desk {
         };
         let (tx, rx) = mpsc::channel();
         self.outgoing = Some(rx);
+        let settings = self.review_settings.clone();
+        let (review_tx, review_rx) = mpsc::sync_channel(1);
+        self.review_rx = settings.as_ref().map(|_| review_rx);
         self.mode = Mode::Desk;
         self.status = "エージェントを起動しています".into();
         std::thread::spawn(move || {
             let result = store::Sqlite::open(&path)
                 .map_err(|e| e.to_string())
                 .and_then(|mut store| {
-                    agent::run_verified(&mut store, id, rev, &config, Some(&prompt))
-                        .map_err(|e| e.to_string())
+                    match settings {
+                        Some(settings) => review_agent::run(
+                            &mut store, id, rev, &config, &prompt, &settings, review_tx,
+                        ),
+                        None => agent::run_verified(&mut store, id, rev, &config, Some(&prompt)),
+                    }
+                    .map_err(|e| e.to_string())
                 });
             let status = match result {
                 Ok(_) => "エージェントの返事が届きました".into(),
@@ -877,15 +925,51 @@ impl Desk {
     }
 
     fn tick(&mut self, now: Instant) {
+        if self.live_review.as_ref().is_some_and(|n| now >= n.deadline) {
+            self.live_review = None;
+            self.note_visible = false;
+            if self.mode == Mode::LiveReview {
+                self.mode = Mode::Desk;
+            }
+        }
+        if self.live_review.is_none()
+            && let Some(rx) = &self.review_rx
+            && let Ok(notice) = rx.try_recv()
+            && now < notice.deadline
+        {
+            self.live_review = Some(notice);
+        }
+        if let Some(watcher) = &mut self.pr_watcher {
+            match watcher.tick(&mut *self.store, now) {
+                Ok(n) if n > 0 => {
+                    let _ = self.reload();
+                    self.status = format!("すべてのPRが閉じた {n} 件を次の行動へ移しました");
+                }
+                Err(e) => self.status = e.to_string(),
+                _ => {}
+            }
+        }
         if let Some(rx) = &self.outgoing {
             match rx.try_recv() {
                 Ok(message) => {
                     self.outgoing = None;
+                    self.review_rx = None;
+                    self.live_review = None;
+                    self.note_visible = false;
+                    if self.mode == Mode::LiveReview {
+                        self.mode = Mode::Desk;
+                    }
                     self.status = message;
                     let _ = self.reload();
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.outgoing = None;
+                    self.review_rx = None;
+                    self.live_review = None;
+                    self.note_visible = false;
+                    if self.mode == Mode::LiveReview {
+                        self.mode = Mode::Desk;
+                    }
                     self.status = "実行プロセスが終了しました".into();
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -991,8 +1075,9 @@ impl Desk {
                     self.entries[i].len()
                 ));
             let capacity = rect.height.saturating_sub(2) as usize;
+            let question_count = self.questions.len() + usize::from(self.live_review.is_some());
             let show_question_row =
-                i == 0 && !self.questions.is_empty() && capacity > usize::from(selected);
+                i == 0 && question_count > 0 && capacity > usize::from(selected);
             let capacity = capacity.saturating_sub(usize::from(show_question_row));
             let offset = if selected {
                 self.selected_row.saturating_sub(capacity.saturating_sub(1))
@@ -1028,7 +1113,7 @@ impl Desk {
                 });
             let questions = if show_question_row {
                 vec![
-                    ListItem::new(format!("! 問い ({})", self.questions.len()))
+                    ListItem::new(format!("! 問い ({question_count})"))
                         .style(Style::new().fg(Color::Rgb(224, 175, 104))),
                 ]
             } else {
@@ -1087,10 +1172,16 @@ impl Desk {
                     summary.push_str(&format!("\n\n指示: {}", x.instructions));
                 }
                 match self.store.latest_run(x.id) {
-                    Ok(Some(run)) => summary.push_str(&format!(
-                        "\n\n実行 #{} · {} · {} ({})\n{}",
-                        run.id, run.provider, run.state, run.activity, run.result
-                    )),
+                    Ok(Some(run)) => {
+                        summary.push_str(&format!(
+                            "\n\n実行 #{} · {} · {} ({})",
+                            run.id, run.provider, run.state, run.activity
+                        ));
+                        if let Some(native) = &run.session_id {
+                            summary.push_str(&format!("\nセッション: {native}"));
+                        }
+                        summary.push_str(&format!("\n{}", run.result));
+                    }
                     Err(e) => summary.push_str(&format!("\n\n実行状況の取得に失敗: {e}")),
                     Ok(None) => {}
                 }
@@ -1117,7 +1208,9 @@ impl Desk {
         } else {
             "WORK (saved locally)"
         };
-        let question_status = if self.questions.is_empty() {
+        let question_status = if self.live_review.is_some() {
+            " ! Codexの判断待ち".into()
+        } else if self.questions.is_empty() {
             String::new()
         } else {
             format!(" ! 問い {}", self.questions.len())
@@ -1213,10 +1306,52 @@ impl Desk {
                 }
             }
             Mode::Artifacts=>popup(f,area,"成果物（デモ）","report.md\n\n## 試作の確認結果\nタイトルと本文からタスクを作成できました。\n次は、実行結果を「あなたの番」で確認してください。\n\nEsc: 閉じる".into(),10),
+            Mode::LiveReview => {
+                self.note_visible = false;
+                if let Some(notice) = &self.live_review {
+                    let remaining = notice.deadline.saturating_duration_since(Instant::now()).as_secs();
+                    let base = format!("Codex app-server / 残り {remaining} 秒
+");
+                    let height = area.height.saturating_sub(4).min(32);
+                    let width = area.width.min(64).saturating_sub(2);
+                    let note = self.review_settings.as_ref().and_then(|c| c.note.as_deref());
+                    let mut body = format!("{base}
+要求: {}
+権限の引き上げは許可できません。
+n / Esc: 拒否　c: 実行を中断", notice.method);
+                    if notice.method == "item/tool/call" && let Some(note) = note {
+                        let destination = self.agent_config.as_ref().map_or_else(String::new, agent::Config::destination);
+                        let candidate = format!("{base}送信先: {destination}
+{}
+
+{}
+
+y: この全文を一度だけ送信
+n / Esc: 拒否　c: 実行を中断", note.path().display(), note.content());
+                        self.note_visible = Paragraph::new(candidate.as_str()).wrap(Wrap { trim:false })
+                            .line_count(width) <= usize::from(height.saturating_sub(2));
+                        body = if self.note_visible { candidate } else {
+                            format!("{base}
+メモ全文が見えないため許可できません。
+端末を広げるか拒否してください。
+n / Esc: 拒否　c: 実行を中断")
+                        };
+                    }
+                    popup(f,area,"Codexの要求",body,height);
+                }
+            }
             Mode::SendConfirm(_,prompt)=>{
                 let destination=self.agent_config.as_ref().map_or_else(String::new,agent::Config::destination);
-                let scope=if self.agent_config.as_ref().is_some_and(agent::Config::allow_file_reads) {"CLIのファイル読み取り: 有効"}else{"CLIのファイル読み取り: 無効を要求"};
-                let preview=format!("送信先: {destination}\n{scope}\n{}\n\n{prompt}",agent::TRUST_WARNING);
+                let scope=if self.review_settings.as_ref().is_some_and(|s| s.note.is_some()) {
+                    "ファイル読み取り: 無効を要求。指定メモは別の確認が必要"
+                } else if self.agent_config.as_ref().is_some_and(agent::Config::allow_file_reads) {
+                    "CLIのファイル読み取り: 有効"
+                } else {
+                    "CLIのファイル読み取り: 無効を要求"
+                };
+                let history = self.agent_config.as_ref().and_then(agent::Config::history_warning).unwrap_or("");
+                let review = if self.review_settings.is_some() { "\nCodex app-server（対話承認つき）" } else { "" };
+                let preview=format!("送信先: {destination}\n{scope}{review}\n{}{}\n\n{prompt}",agent::TRUST_WARNING, if history.is_empty() { String::new() } else { format!("\n{history}") });
                 let w=area.width.min(64).saturating_sub(2);
                 let height=area.height.saturating_sub(4).min(28);
                 let paragraph=Paragraph::new(preview.as_str()).wrap(Wrap{trim:false});
@@ -1292,10 +1427,14 @@ fn tui(
     demo: bool,
     path: Option<PathBuf>,
     config: Option<agent::Config>,
+    pr_watcher: Option<pr_watch::Watcher>,
+    review_settings: Option<review_agent::Settings>,
 ) -> io::Result<()> {
     let mut desk = Desk::new(store, demo).map_err(io::Error::other)?;
     desk.profile_path = path;
     desk.agent_config = config;
+    desk.pr_watcher = pr_watcher;
+    desk.review_settings = review_settings;
     let mut terminal = ratatui::try_init()?;
     let bracketed = execute!(io::stdout(), EnableBracketedPaste).is_ok();
     let result = (|| {
@@ -1326,6 +1465,10 @@ fn tui(
                 let large_enough = terminal
                     .size()
                     .is_ok_and(|s| s.width >= MIN_WIDTH && s.height >= MIN_HEIGHT);
+                if !large_enough {
+                    desk.can_confirm = false;
+                    desk.note_visible = false;
+                }
                 // Do not accidentally send or edit a hidden draft on a tiny terminal.
                 let quit =
                     key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');

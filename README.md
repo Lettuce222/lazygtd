@@ -120,15 +120,20 @@ There is no automatic launch or credential registration.
 The worker cannot mark a GTD task complete via its response. The app reserves
 at most one active run per task; the exit status and provider protocol
 determine the result. Both a report and a failure hand the task back to
-the human review box. Fresh setup and existing v1–v4 databases use the same v5
+the human review box. Fresh setup and existing v1–v5 databases use the same v6
 schema; older binaries cannot open a migrated database. See [storage design and spec progress](docs/spec-progress.md).
 
 These adapters are for read-only research/planning in a trusted workspace;
 they are not OS isolation for arbitrary or untrusted repositories. They
 request the provider's read-only tool restrictions, do not include write,
 push or external-post adapters, and do not bypass permission prompts.
-Actual worktree edits, provider session resume, external approval execution, trigger automation and import
-from the old Hub are not in this preview. Real runs are foreground in the
+Optional integrations:
+- [Public GitHub PR monitoring](docs/pr-watch.md) while the TUI runs.
+- [Resume an exact Codex or Claude Code session](docs/agent-sessions.md).
+- [Live, narrowly scoped Codex approvals](docs/approvals.md).
+
+Actual worktree edits, general command approvals, Claude's interactive approval flow,
+always-on automation, and import from the old Hub are outside this scope. Real runs are foreground in the
 launching terminal; a forced process shutdown may leave an active record
 that needs manual recovery. After verifying the worker really stopped, run
 `agent-recover ID RUN --confirmed-stopped`. This only repairs the local record,
