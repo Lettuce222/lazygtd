@@ -145,6 +145,7 @@ impl Desk {
         let selected = self.picked().map(|item| item.id);
         let query = self.query.to_lowercase();
         let mut entries: [Vec<Item>; BOXES.len()] = std::array::from_fn(|_| Vec::new());
+        let mut handback_next = Vec::new();
         for item in self.store.list()?.into_iter().filter(|item| !item.done) {
             let Some(box_id) = BOX_IDS.iter().position(|id| *id == item.box_id) else {
                 continue;
@@ -165,7 +166,7 @@ impl Desk {
                 entries[0].push(item.clone());
             }
             if item.agent_review && box_id == 0 && (self.selected_box != 3 || matches) {
-                entries[3].push(item.clone());
+                handback_next.push(item.clone());
             }
             if item.project_id.is_some() && item.box_id == "someday" {
                 continue;
@@ -174,6 +175,7 @@ impl Desk {
                 entries[box_id].push(item);
             }
         }
+        entries[3].extend(handback_next);
         self.entries = entries;
         let rows = &self.entries[self.selected_box];
         self.selected_row = rows
