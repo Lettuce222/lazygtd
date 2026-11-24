@@ -262,6 +262,12 @@ fn default_db_is_private_and_rejects_public_files_and_symlinks() {
     use std::os::unix::fs::{PermissionsExt, symlink};
     let t = Temp::new();
     json(t.run(&["add", "private body"]));
+    #[cfg(target_os = "macos")]
+    let root =
+        t.0.join("Library")
+            .join("Application Support")
+            .join("lazygtd");
+    #[cfg(not(target_os = "macos"))]
     let root = t.0.join("lazygtd");
     let db = root.join("work.sqlite3");
     assert_eq!(
@@ -281,4 +287,29 @@ fn default_db_is_private_and_rejects_public_files_and_symlinks() {
     );
     std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert!(!t.run(&["list"]).status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn database_can_live_under_os_ancestor_alias_but_not_a_symlinked_leaf() {
+    use std::os::unix::fs::symlink;
+    let t = Temp::new();
+    let real = t.0.join("real");
+    std::fs::create_dir_all(real.join("db")).unwrap();
+    symlink(&real, t.0.join("alias")).unwrap();
+    let aliased = t.0.join("alias/db/task.sqlite");
+    json(t.run(&[
+        "--db",
+        aliased.to_str().unwrap(),
+        "add",
+        "path normalization",
+    ]));
+    let real_leaf = real.join("db/task.sqlite");
+    let malicious = t.0.join("other.sqlite");
+    symlink(&real_leaf, &malicious).unwrap();
+    assert!(
+        !t.run(&["--db", malicious.to_str().unwrap(), "list"])
+            .status
+            .success()
+    );
 }

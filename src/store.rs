@@ -185,6 +185,21 @@ CREATE TABLE event (
 
 impl Sqlite {
     pub fn open(path: &Path) -> Result<Self> {
+        // macOS exposes its system temp directory through /var -> /private/var.
+        // Normalize only ancestors; never resolve the database leaf itself.
+        #[cfg(unix)]
+        let normalized = {
+            let parent = path
+                .parent()
+                .filter(|x| !x.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let leaf = path
+                .file_name()
+                .ok_or(StoreError::Invalid("database file name is missing"))?;
+            parent.canonicalize().map_err(StoreError::Io)?.join(leaf)
+        };
+        #[cfg(unix)]
+        let path = normalized.as_path();
         crate::db_file::prepare(path).map_err(StoreError::Io)?;
         let flags = rusqlite::OpenFlags::default() & !rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
         Self::init(
