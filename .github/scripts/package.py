@@ -4,8 +4,10 @@ import argparse
 import io
 import json
 import pathlib
+import platform
 import re
 import subprocess
+import sys
 import tarfile
 import zipfile
 
@@ -58,18 +60,38 @@ def main():
     cli.add_argument("--tag", required=True)
     cli.add_argument("--platform", required=True)
     cli.add_argument("--target", required=True)
+    cli.add_argument("--cross-apple-silicon", action="store_true")
     parsed = cli.parse_args()
     if not TAG.fullmatch(parsed.tag) or not re.fullmatch(r"[a-z0-9_-]+", parsed.platform):
         raise ValueError("invalid release tag or platform")
     windows = parsed.platform.startswith("windows-")
     binary = "lazygtd.exe" if windows else "lazygtd"
     path = pathlib.Path("target", parsed.target, "release", binary).resolve(strict=True)
-    version = subprocess.check_output([path, "--version"], text=True, encoding="utf-8").strip()
-    if version != f"lazygtd {parsed.tag[1:]}":
-        raise ValueError("Cargo package version does not match tag")
-    sample = json.loads(subprocess.check_output([path, "--demo", "list", "--json"]))
-    if len(sample) < 2 or not any(item["box_id"] == "inbox" for item in sample):
-        raise ValueError("release binary failed in-memory SQLite smoke test")
+    if parsed.cross_apple_silicon:
+        if (sys.platform, platform.machine(), parsed.platform, parsed.target) != (
+            "darwin", "x86_64", "macos-arm64", "aarch64-apple-darwin"
+        ):
+            raise ValueError("cross-build exception is only for Apple Silicon from Intel macOS")
+        arch = subprocess.check_output(["lipo", "-archs", path], text=True, encoding="utf-8").strip()
+        if arch != "arm64":
+            raise ValueError(f"expected a thin arm64 Mach-O; got {arch!r}")
+        metadata = json.loads(subprocess.check_output(
+            ["cargo", "metadata", "--no-deps", "--locked", "--format-version", "1"]
+        ))
+        manifest = pathlib.Path("Cargo.toml").resolve(strict=True)
+        matches = [
+            pkg for pkg in metadata["packages"]
+            if pkg["name"] == "lazygtd" and pathlib.Path(pkg["manifest_path"]).resolve() == manifest
+        ]
+        if len(matches) != 1 or matches[0]["version"] != parsed.tag[1:]:
+            raise ValueError("Cargo package version does not match tag")
+    else:
+        version = subprocess.check_output([path, "--version"], text=True, encoding="utf-8").strip()
+        if version != f"lazygtd {parsed.tag[1:]}":
+            raise ValueError("Cargo package version does not match tag")
+        sample = json.loads(subprocess.check_output([path, "--demo", "list", "--json"]))
+        if len(sample) < 2 or not any(item["box_id"] == "inbox" for item in sample):
+            raise ValueError("release binary failed in-memory SQLite smoke test")
     output = pathlib.Path("dist")
     output.mkdir(exist_ok=True)
     entries = [

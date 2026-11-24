@@ -45,7 +45,8 @@ jobs:
           - runner: windows-11-arm
             platform: windows-arm64
             target: aarch64-pc-windows-msvc
-          - runner: macos-15
+          # Temporary fallback while the native Apple Silicon pool is unavailable.
+          - runner: macos-15-intel
             platform: macos-arm64
             target: aarch64-apple-darwin
           - runner: macos-15-intel
@@ -60,14 +61,24 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - name: Test and build Unix
-        if: runner.os != 'Windows'
+      - name: Test and build native Unix
+        if: runner.os != 'Windows' && matrix.platform != 'macos-arm64'
         shell: bash
         run: |
           set -euo pipefail
           rustup target add "$BUILD_TARGET"
           cargo test --locked --target "$BUILD_TARGET"
           cargo build --release --locked --target "$BUILD_TARGET"
+      - name: Cross-compile Apple Silicon on Intel
+        if: matrix.platform == 'macos-arm64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          rustup target add "$BUILD_TARGET"
+          cargo test --locked --no-run --target "$BUILD_TARGET"
+          cargo build --release --locked --target "$BUILD_TARGET"
+          test "$(lipo -archs "target/$BUILD_TARGET/release/lazygtd")" = arm64
       - name: Test and build Windows
         if: runner.os == 'Windows'
         shell: pwsh
@@ -81,9 +92,13 @@ jobs:
           cargo build --release --locked --target $env:BUILD_TARGET
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Smoke test and package tagged Unix build
-        if: runner.os != 'Windows' && startsWith(github.ref, 'refs/tags/v')
+        if: runner.os != 'Windows' && matrix.platform != 'macos-arm64' && startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: python3 .github/scripts/package.py --tag "$TAG" --platform "$PLATFORM" --target "$BUILD_TARGET"
+      - name: Verify architecture and package tagged Apple Silicon build
+        if: matrix.platform == 'macos-arm64' && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: python3 .github/scripts/package.py --tag "$TAG" --platform "$PLATFORM" --target "$BUILD_TARGET" --cross-apple-silicon
       - name: Smoke test and package tagged Windows build
         if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
@@ -149,4 +164,4 @@ jobs:
           if [[ "$TAG" == *-preview.* ]]; then flags+=(--prerelease); fi
           gh release create "$TAG" "${assets[@]}" SHA256SUMS \
             --verify-tag "${flags[@]}" --title "lazygtd $TAG" \
-            --notes 'Includes tested builds with bundled SQLite, SHA256SUMS and GitHub build provenance. The executables are not OS-signed or notarized.'
+            --notes 'Includes builds with bundled SQLite, SHA256SUMS and GitHub build provenance. The Apple Silicon build was cross-compiled on Intel, checked for arm64 architecture and its test targets compiled, but was not executed on Apple Silicon. Other release targets were tested natively. The executables are not OS-signed or notarized.'
