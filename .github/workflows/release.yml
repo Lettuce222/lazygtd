@@ -1,0 +1,152 @@
+name: Build and release
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  lint:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Check formatting and lint
+        run: |
+          rustup component add rustfmt clippy
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+
+  build:
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            platform: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            platform: linux-aarch64
+            target: aarch64-unknown-linux-gnu
+          - runner: windows-2025
+            platform: windows-x86_64
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            platform: windows-arm64
+            target: aarch64-pc-windows-msvc
+          - runner: macos-15
+            platform: macos-arm64
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            platform: macos-x86_64
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    env:
+      BUILD_TARGET: ${{ matrix.target }}
+      PLATFORM: ${{ matrix.platform }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Test and build Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add "$BUILD_TARGET"
+          cargo test --locked --target "$BUILD_TARGET"
+          cargo build --release --locked --target "$BUILD_TARGET"
+      - name: Test and build Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          rustup target add $env:BUILD_TARGET
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --target $env:BUILD_TARGET
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --release --locked --target $env:BUILD_TARGET
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Smoke test and package tagged Unix build
+        if: runner.os != 'Windows' && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: python3 .github/scripts/package.py --tag "$TAG" --platform "$PLATFORM" --target "$BUILD_TARGET"
+      - name: Smoke test and package tagged Windows build
+        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: python .github/scripts/package.py --tag $env:TAG --platform $env:PLATFORM --target $env:BUILD_TARGET
+      - name: Keep checked binaries from branch builds
+        if: "!startsWith(github.ref, 'refs/tags/v')"
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir dist
+          name=lazygtd
+          if [[ "$PLATFORM" == windows-* ]]; then name=lazygtd.exe; fi
+          cp "target/$BUILD_TARGET/release/$name" LICENSE dist/
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    needs: [lint, build]
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: dist
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]+)?$ ]]
+          sha256sum -- \
+            "lazygtd-$TAG-linux-x86_64.tar.gz" "lazygtd-$TAG-linux-aarch64.tar.gz" \
+            "lazygtd-$TAG-macos-arm64.tar.gz" "lazygtd-$TAG-macos-x86_64.tar.gz" \
+            "lazygtd-$TAG-windows-x86_64.zip" "lazygtd-$TAG-windows-arm64.zip" > SHA256SUMS
+      - name: Attest signed build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
+      - name: Publish checked GitHub Release
+        working-directory: dist
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha256sum -c --strict SHA256SUMS
+          mapfile -t assets < <(cut -d ' ' -f 3 SHA256SUMS)
+          flags=()
+          if [[ "$TAG" == *-preview.* ]]; then flags+=(--prerelease); fi
+          gh release create "$TAG" "${assets[@]}" SHA256SUMS \
+            --verify-tag "${flags[@]}" --title "lazygtd $TAG" \
+            --notes 'Includes tested builds with bundled SQLite, SHA256SUMS and GitHub build provenance. The executables are not OS-signed or notarized.'

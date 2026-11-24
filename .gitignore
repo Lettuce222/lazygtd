@@ -1,0 +1,23 @@
+/target/
+
+# Local build and package output
+/dist/
+*.exe
+__pycache__
+/actionlint
+
+# Local credentials, agent settings, and user data
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+agent.local.json
+agent.json
+*.sqlite
+*.sqlite3
+*.db
+*-wal
+*-shm
+*-journal
+*.assets/

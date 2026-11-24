@@ -1,0 +1,16 @@
+[package]
+name = "lazygtd"
+version = "0.1.0-preview.2"
+edition = "2024"
+rust-version = "1.89"
+description = "A local-first GTD terminal desk"
+license = "MIT"
+repository = "https://github.com/Lettuce222/lazygtd"
+publish = false
+
+[dependencies]
+ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm_0_28","unstable-rendered-line-info"] }
+crossterm = "=0.28.1"
+rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
