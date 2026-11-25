@@ -52,6 +52,8 @@ not signed or notarized; checksums do not override platform trust prompts.
   approval waits. Entries can also remain visible in their original project
   or waiting box. Legacy review/desk data is shown in Next Actions without changes
   to the underlying database.
+  Someday and Reference collapse to their headers when they are not selected.
+  Every task list shows its position and current filtered count at the bottom right.
   Finished items are available from the CLI, not shown in active TUI boxes.
   `Enter` focuses the instruction/reply box, `p` manages project steps, `t`
   edits planning fields, `!` opens questions, and `o` shows artifacts.

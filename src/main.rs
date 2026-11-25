@@ -37,7 +37,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::Text,
+    text::{Line, Text},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 
@@ -1098,18 +1098,27 @@ impl Desk {
             Layout::horizontal([Constraint::Percentage(42), Constraint::Fill(1)]).areas(board);
         let [detail, compose] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(6)]).areas(right);
-        for (i, rect) in sidebar_slots(sidebar).into_iter().enumerate() {
+        for (i, rect) in sidebar_slots(sidebar, self.selected_box)
+            .into_iter()
+            .enumerate()
+        {
             let selected = i == self.selected_box;
+            let total = self.entries[i].len();
+            let position = if selected && total > 0 {
+                self.selected_row.min(total - 1) + 1
+            } else {
+                0
+            };
             let block = Block::default()
                 .borders(Borders::ALL)
                 .style(BASE)
                 .border_style(if selected { FOCUS } else { BASE })
-                .title(format!(
-                    " {} {} ({}) ",
-                    i + 1,
-                    BOXES[i],
-                    self.entries[i].len()
-                ));
+                .title(format!(" {} {} ", i + 1, BOXES[i]))
+                .title_bottom(Line::from(format!(" {position} of {total} ")).right_aligned());
+            if sidebar_collapsed(i, self.selected_box) {
+                f.render_widget(block, rect);
+                continue;
+            }
             let capacity = rect.height.saturating_sub(2) as usize;
             let question_count = self.questions.len() + usize::from(self.live_review.is_some());
             let show_question_row =
@@ -1438,11 +1447,27 @@ fn editor_text(draft: &str, action: &str) -> String {
     format!("{preview}\n\n{action}  Ctrl+J / Shift+Enter: newline  Esc: cancel")
 }
 
-fn sidebar_slots(sidebar: Rect) -> [Rect; BOXES.len()] {
+fn sidebar_collapsed(index: usize, selected: usize) -> bool {
+    matches!(DISPLAY_BOX_IDS[index], "someday" | "reference") && index != selected
+}
+
+fn sidebar_slots(sidebar: Rect, selected: usize) -> [Rect; BOXES.len()] {
+    let collapsed = (0..BOXES.len())
+        .filter(|&i| sidebar_collapsed(i, selected))
+        .count() as u16;
+    let header_height = 2.min(sidebar.height / BOXES.len() as u16);
+    let open = BOXES.len() as u16 - collapsed;
+    let height_for_open = sidebar.height - collapsed * header_height;
     let mut y = sidebar.y;
+    let mut slot = 0;
     std::array::from_fn(|i| {
-        let count = BOXES.len() as u16;
-        let height = sidebar.height / count + u16::from((i as u16) < sidebar.height % count);
+        let height = if sidebar_collapsed(i, selected) {
+            header_height
+        } else {
+            let extra = u16::from(slot < height_for_open % open);
+            slot += 1;
+            height_for_open / open + extra
+        };
         let rect = Rect::new(sidebar.x, y, sidebar.width, height);
         y += height;
         rect
@@ -1690,7 +1715,7 @@ mod tests {
     }
 
     #[test]
-    fn rendered_boxes_do_not_move_when_switching_or_finishing_items() {
+    fn expanded_reference_does_not_resize_when_finishing_items() {
         let mut desk = Desk::demo();
         let titles = |frame: &[String]| {
             BOXES.map(|title| {
@@ -1708,7 +1733,7 @@ mod tests {
         };
         let before = view(&mut desk, 100, 31);
         let expected = titles(&before);
-        assert_eq!(expected, [0, 5, 10, 15, 20, 25]);
+        assert_eq!(expected, [0, 7, 13, 19, 25, 27]);
         press(&mut desk, '1');
         assert_eq!(titles(&view(&mut desk, 100, 31)), expected);
         desk.selected_row = desk.entries[INBOX]
@@ -1721,7 +1746,8 @@ mod tests {
         }));
         press(&mut desk, '6');
         let after = view(&mut desk, 100, 31);
-        assert_eq!(titles(&after), expected);
+        let expanded = titles(&after);
+        assert_eq!(expanded, [0, 6, 12, 17, 22, 24]);
         assert!(after.iter().any(|line| {
             line.replace(char::is_whitespace, "")
                 .contains("キーバインドの早見表")
@@ -1729,8 +1755,54 @@ mod tests {
         press(&mut desk, 'x');
         press(&mut desk, 'x');
         let empty = view(&mut desk, 100, 31);
-        assert_eq!(titles(&empty), expected);
+        assert_eq!(titles(&empty), expanded);
         assert!(empty.iter().any(|line| line.contains("(empty box)")));
+    }
+
+    #[test]
+    fn low_priority_boxes_collapse_and_counters_track_focus_filter_and_empty_lists() {
+        let mut desk = Desk::demo();
+        let someday = 4;
+        let reference = 5;
+
+        let read = |desk: &mut Desk, i: usize| {
+            let frame = view(desk, 100, 40);
+            let rect = sidebar_slots(Rect::new(0, 0, 42, 38), desk.selected_box)[i];
+            let line = |y| frame[y as usize].chars().take(42).collect::<String>();
+            // The counter must be flush right on the bottom border.
+            assert!(line(rect.bottom() - 1).ends_with(" ┘"));
+            let bottom = line(rect.bottom() - 1);
+            (
+                rect.height,
+                bottom,
+                (rect.y + 1..rect.bottom() - 1)
+                    .map(line)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        for i in [someday, reference] {
+            let (height, bottom, rows) = read(&mut desk, i);
+            assert_eq!(height, 2);
+            assert!(rows.is_empty());
+            assert!(bottom.ends_with(&format!(" 0 of {} ┘", desk.entries[i].len())));
+        }
+        press(&mut desk, '6');
+        let (h, footer, rows) = read(&mut desk, reference);
+        assert!(h > 2);
+        assert!(footer.ends_with(" 1 of 2 ┘"));
+        assert!(
+            rows.join("\n")
+                .replace(char::is_whitespace, "")
+                .contains("キーバインドの早見表")
+        );
+        press(&mut desk, 'j');
+        assert!(read(&mut desk, reference).1.ends_with(" 2 of 2 ┘"));
+        desk.query = "does-not-match-the-demo".into();
+        desk.reload().unwrap();
+        assert!(read(&mut desk, reference).1.ends_with(" 0 of 0 ┘"));
+        press(&mut desk, '5');
+        assert!(read(&mut desk, someday).0 > 2);
+        assert_eq!(read(&mut desk, reference).0, 2);
     }
 
     #[test]
