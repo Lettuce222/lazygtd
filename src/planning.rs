@@ -35,6 +35,7 @@ pub struct Meta {
     pub outcome: Option<String>,
     pub short: Option<String>,
     pub links: Vec<String>,
+    pub source: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -55,6 +56,8 @@ pub enum PlanField {
     Outcome,
     Short,
     Links,
+    Since,
+    Source,
 }
 
 impl PlanField {
@@ -68,6 +71,8 @@ impl PlanField {
             "outcome" => Self::Outcome,
             "short" => Self::Short,
             "links" => Self::Links,
+            "since" => Self::Since,
+            "source" => Self::Source,
             _ => return Err(StoreError::Invalid("unknown planning field")),
         })
     }
@@ -82,6 +87,8 @@ impl PlanField {
             Self::Outcome => "outcome",
             Self::Short => "short",
             Self::Links => "links",
+            Self::Since => "since",
+            Self::Source => "source",
         }
     }
 }
@@ -122,7 +129,8 @@ pub fn metadata(c: &Connection, id: i64) -> Result<Meta> {
 pub fn steps(c: &Connection, project: i64) -> Result<Vec<Step>> {
     let mut q = c.prepare(
         "SELECT i.id,i.revision,i.title,
-             CASE WHEN i.done=1 THEN 'done'
+             CASE WHEN i.archived=1 THEN 'archived'
+                  WHEN i.done=1 THEN 'done'
                   WHEN i.box_id='someday' THEN 'planned'
                   WHEN i.box_id='review' THEN 'review'
                   ELSE i.box_id END
@@ -159,29 +167,27 @@ pub fn is_planned(c: &Connection, id: i64) -> Result<bool> {
     )?)
 }
 
-pub fn change_meta(
-    tx: &Transaction<'_>,
-    id: i64,
-    rev: i64,
-    field: PlanField,
-    value: &str,
-) -> Result<i64> {
-    let item = current(tx, id, rev, false)?;
+/// Reject fields that only apply to a particular box.
+pub fn check_box(field: PlanField, box_id: &str) -> Result<()> {
     if matches!(
         field,
         PlanField::FollowUp | PlanField::Who | PlanField::Then | PlanField::Watch
-    ) && item.bx != "waiting"
+    ) && box_id != "waiting"
     {
         return Err(StoreError::Invalid(
             "waiting fields require the waiting box",
         ));
     }
-    if matches!(field, PlanField::Outcome | PlanField::Short) && item.bx != "projects" {
+    if matches!(field, PlanField::Outcome | PlanField::Short) && box_id != "projects" {
         return Err(StoreError::Invalid("that field requires a project"));
     }
+    Ok(())
+}
 
+/// Validate a planning value and return the JSON stored for it (`null` clears).
+pub fn normalize(field: PlanField, value: &str) -> Result<serde_json::Value> {
     let s = value.trim();
-    let value = match field {
+    Ok(match field {
         PlanField::Links => {
             let urls = s
                 .lines()
@@ -196,7 +202,7 @@ pub fn change_meta(
             serde_json::json!(urls)
         }
         _ if s.is_empty() => serde_json::Value::Null,
-        PlanField::Due | PlanField::FollowUp => {
+        PlanField::Due | PlanField::FollowUp | PlanField::Since => {
             if !valid_date(s) {
                 return Err(StoreError::Invalid(
                     "use a real calendar date in YYYY-MM-DD format",
@@ -226,7 +232,19 @@ pub fn change_meta(
             }
             serde_json::json!(s)
         }
-    };
+    })
+}
+
+pub fn change_meta(
+    tx: &Transaction<'_>,
+    id: i64,
+    rev: i64,
+    field: PlanField,
+    value: &str,
+) -> Result<i64> {
+    let item = current(tx, id, rev, false)?;
+    check_box(field, &item.bx)?;
+    let value = normalize(field, value)?;
     let path = format!("$.planning.{}", field.key());
     let normalized = value.to_string();
     let previous: String = tx.query_row(
@@ -250,7 +268,7 @@ pub fn change_meta(
 
 /// Convert a task to the local next action "put it on the calendar".
 /// No dates are invented and no external calendar is opened or modified.
-pub fn mark_calendar(tx: &Transaction<'_>, id: i64, rev: i64) -> Result<()> {
+pub fn mark_calendar(tx: &Transaction<'_>, id: i64, rev: i64, actor: &str) -> Result<()> {
     let item = current(tx, id, rev, false)?;
     if item.bx == "projects" {
         return Err(StoreError::Invalid(
@@ -270,7 +288,7 @@ pub fn mark_calendar(tx: &Transaction<'_>, id: i64, rev: i64) -> Result<()> {
     if item.bx == "next" {
         touch(tx, id, "plan-meta")?;
     } else {
-        set_box(tx, id, "next")?;
+        set_box(tx, id, "next", actor)?;
     }
     tx.execute(
         "UPDATE item SET details=json_set(details,'$.planning.calendar_action',json('true')) WHERE id=?",
@@ -311,7 +329,7 @@ pub fn attach(
     touch(tx, project, "step-attach")?;
     touch(tx, step, "step-attach")?;
     if !s.done && !matches!(s.bx.as_str(), "next" | "waiting" | "someday" | "review") {
-        set_box(tx, step, "someday")?;
+        set_box(tx, step, "someday", SYSTEM)?;
     }
     promote(tx, project)
 }
@@ -381,7 +399,7 @@ pub fn before_item_change(tx: &Transaction<'_>, id: i64, dest: Option<&str>) -> 
             return Err(StoreError::Invalid("detach project steps before moving the project"));
         }
     } else if tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM project_step s JOIN item i ON i.id=s.step_id WHERE s.project_id=? AND i.done=0)",
+        "SELECT EXISTS(SELECT 1 FROM project_step s JOIN item i ON i.id=s.step_id WHERE s.project_id=? AND i.done=0 AND i.archived=0)",
         [id], |r| r.get::<_,bool>(0),
     )? {
         return Err(StoreError::Invalid("complete or detach the project's remaining steps first"));
@@ -404,10 +422,10 @@ fn promote(tx: &Transaction<'_>, project: i64) -> Result<()> {
         .query_row(
             "SELECT s.step_id
          FROM project_step s JOIN item i ON i.id=s.step_id
-         WHERE s.project_id=?1 AND i.done=0 AND i.box_id='someday'
+         WHERE s.project_id=?1 AND i.done=0 AND i.archived=0 AND i.box_id='someday'
            AND NOT EXISTS (
               SELECT 1 FROM project_step a JOIN item b ON b.id=a.step_id
-              WHERE a.project_id=?1 AND b.done=0 AND (b.box_id IN ('next','review')
+              WHERE a.project_id=?1 AND b.done=0 AND b.archived=0 AND (b.box_id IN ('next','review')
                   OR EXISTS(SELECT 1 FROM agent_run r WHERE r.item_id=b.id AND r.state='running'))
            )
          ORDER BY s.position LIMIT 1",
@@ -416,7 +434,7 @@ fn promote(tx: &Transaction<'_>, project: i64) -> Result<()> {
         )
         .optional()?;
     if let Some(next) = next {
-        set_box(tx, next, "next")?;
+        set_box(tx, next, "next", SYSTEM)?;
     }
     Ok(())
 }
@@ -437,13 +455,13 @@ struct Current {
 }
 
 fn current(tx: &Transaction<'_>, id: i64, expect: i64, allow_done: bool) -> Result<Current> {
-    let (rev, bx, done, active): (i64, String, bool, bool) = tx
+    let (rev, bx, done, archived, active): (i64, String, bool, bool, bool) = tx
         .query_row(
-            "SELECT revision,box_id,done,
+            "SELECT revision,box_id,done,archived,
                 EXISTS(SELECT 1 FROM agent_run WHERE item_id=?1 AND state='running')
          FROM item WHERE id=?1",
             [id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?
         .ok_or(StoreError::Missing(id))?;
@@ -453,6 +471,11 @@ fn current(tx: &Transaction<'_>, id: i64, expect: i64, allow_done: bool) -> Resu
             expected: expect,
             current: rev,
         });
+    }
+    if archived {
+        return Err(StoreError::Invalid(
+            "archived items cannot be changed; reopen first",
+        ));
     }
     if done && !allow_done {
         return Err(StoreError::Invalid("completed items cannot be changed"));
@@ -477,15 +500,17 @@ fn touch(tx: &Transaction<'_>, id: i64, kind: &str) -> Result<()> {
     Ok(())
 }
 
-fn set_box(tx: &Transaction<'_>, id: i64, name: &str) -> Result<()> {
+const SYSTEM: &str = "system:planning";
+
+fn set_box(tx: &Transaction<'_>, id: i64, name: &str, actor: &str) -> Result<()> {
     tx.execute(
         "UPDATE item SET revision=revision+1,box_id=? WHERE id=?",
         params![name, id],
     )?;
     tx.execute(
         "INSERT INTO event(item_id,revision,actor,kind,box_id,done)
-         SELECT id,revision,'system:planning','move',box_id,done FROM item WHERE id=?",
-        [id],
+         SELECT id,revision,?,'move',box_id,done FROM item WHERE id=?",
+        params![actor, id],
     )?;
     update_since(tx, id)
 }
@@ -544,7 +569,8 @@ mod tests {
         c.execute_batch("
             PRAGMA foreign_keys=ON;
             CREATE TABLE item(id INTEGER PRIMARY KEY,revision INTEGER NOT NULL, title TEXT NOT NULL,
-               box_id TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0, details TEXT NOT NULL DEFAULT '{}');
+               box_id TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0, archived INTEGER NOT NULL DEFAULT 0,
+               details TEXT NOT NULL DEFAULT '{}');
             CREATE TABLE event(item_id INTEGER, revision INTEGER, actor TEXT, kind TEXT, box_id TEXT,
                done INTEGER, UNIQUE(item_id,revision));
             CREATE TABLE agent_run(item_id INTEGER, state TEXT);
@@ -687,17 +713,17 @@ mod tests {
     fn calendar_handoff_is_local_idempotent_and_retains_project_membership() {
         let mut c = db();
         let t = c.transaction_with_behavior(transaction()).unwrap();
-        assert!(mark_calendar(&t, 1, 1).is_err());
-        mark_calendar(&t, 5, 1).unwrap();
+        assert!(mark_calendar(&t, 1, 1, "user").is_err());
+        mark_calendar(&t, 5, 1, "user").unwrap();
         assert_eq!(metadata(&t, 5).unwrap().due, None);
         assert!(metadata(&t, 5).unwrap().calendar_action);
         assert!(metadata(&t, 5).unwrap().since.is_some());
         assert_eq!(revision(&t, 5).unwrap(), 2);
         assert!(matches!(
-            mark_calendar(&t, 5, 1),
+            mark_calendar(&t, 5, 1, "user"),
             Err(StoreError::Stale { .. })
         ));
-        mark_calendar(&t, 5, 2).unwrap();
+        mark_calendar(&t, 5, 2, "user").unwrap();
         assert_eq!(revision(&t, 5).unwrap(), 2);
         assert_eq!(current(&t, 5, 2, false).unwrap().bx, "next");
         let count: i64 = t
@@ -709,7 +735,7 @@ mod tests {
 
         attach(&t, 1, 1, 2, 1).unwrap();
         let rev = revision(&t, 2).unwrap();
-        mark_calendar(&t, 2, rev).unwrap();
+        mark_calendar(&t, 2, rev, "user").unwrap();
         assert_eq!(project_of(&t, 2).unwrap(), Some(1));
         assert_eq!(states(&t), [(2, "next".into())]);
         assert!(metadata(&t, 2).unwrap().calendar_action);

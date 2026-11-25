@@ -464,7 +464,7 @@ fn apply_results(store: &mut dyn Store, resolved: Vec<Resolved>) -> (usize, bool
     let mut failed = false;
     for entry in resolved {
         let urls: Vec<_> = entry.urls.iter().map(String::as_str).collect();
-        match store.watch_resolve(entry.id, entry.rev, &urls) {
+        match store.watch_resolve(entry.id, entry.rev, &urls, "system:watch") {
             Ok(item) if item.box_id == "next" => moved += 1,
             Ok(_) | Err(StoreError::Stale { .. } | StoreError::Missing(_)) => {}
             Err(_) => failed = true,
@@ -598,7 +598,7 @@ mod tests {
             .move_to(row.id, row.revision, "waiting", "user")
             .unwrap();
         store
-            .change_meta(row.id, row.revision, PlanField::Watch, watch)
+            .change_meta(row.id, row.revision, PlanField::Watch, watch, "user")
             .unwrap()
     }
 
@@ -770,7 +770,7 @@ esac
             State::Closed
         });
         let row = store
-            .edit_body(row.id, row.revision, "touched during poll")
+            .edit_body(row.id, row.revision, "touched during poll", "user")
             .unwrap();
         assert_eq!(apply_results(&mut store, stale.resolved), (0, false));
         let fresh = sweep(vec![Target::from_item(row.clone()).unwrap()], |_| {
