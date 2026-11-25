@@ -144,6 +144,7 @@ pub enum ReviewDecision {
 #[derive(Debug, Clone)]
 pub struct Review {
     pub method: String,
+    pub detail: Option<String>,
 }
 
 impl Review {
@@ -170,6 +171,7 @@ impl Review {
         id(&params[item]).ok()?;
         Some(Self {
             method: method.to_owned(),
+            detail: None,
         })
     }
 }
@@ -198,7 +200,7 @@ fn deny(message: &Value, cancel: bool) -> Option<Value> {
     })
 }
 
-struct Io {
+pub(crate) struct Io {
     child: Child,
     sink: mpsc::SyncSender<Value>,
     stream: mpsc::Receiver<io::Result<Value>>,
@@ -229,7 +231,7 @@ impl Drop for Io {
 }
 
 impl Io {
-    fn open(cmd: &mut Command, budget: Duration) -> io::Result<Self> {
+    pub(crate) fn open(cmd: &mut Command, budget: Duration) -> io::Result<Self> {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -283,7 +285,7 @@ impl Io {
         })
     }
 
-    fn send(&self, value: Value) -> io::Result<()> {
+    pub(crate) fn send(&self, value: Value) -> io::Result<()> {
         if Instant::now() >= self.deadline {
             return Err(timed_out());
         }
@@ -292,7 +294,7 @@ impl Io {
             .map_err(|_| fail("app-server input closed or overloaded"))
     }
 
-    fn receive(&mut self) -> io::Result<Value> {
+    pub(crate) fn receive(&mut self) -> io::Result<Value> {
         self.frames += 1;
         if self.frames > MAX_FRAMES {
             return Err(fail("too many app-server frames"));
@@ -333,10 +335,10 @@ impl Io {
 }
 
 static HOME_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-struct IsolatedHome(PathBuf);
+pub(crate) struct IsolatedHome(pub(crate) PathBuf);
 
 impl IsolatedHome {
-    fn create() -> io::Result<Self> {
+    pub(crate) fn create() -> io::Result<Self> {
         #[cfg(unix)]
         let base = env::temp_dir();
         #[cfg(windows)]

@@ -438,13 +438,13 @@ impl Config {
         self.model.as_deref()
     }
 
-    pub(crate) fn app_server_command(&self) -> Result<Command> {
-        if !matches!(self.provider, Provider::Codex) {
-            return Err("app-server requires the official Codex CLI".into());
+    pub(crate) fn review_command(&self, selected: &str) -> Result<Command> {
+        if self.provider.name() != selected {
+            return Err("review option must match the configured provider".into());
         }
-        if self.session_mode != SessionMode::Ephemeral {
+        if self.session_mode != SessionMode::Ephemeral || self.allow_file_reads {
             return Err(
-                "app-server does not support native persist/resume in this prototype".into(),
+                "live review requires an ephemeral configuration with file tools disabled".into(),
             );
         }
         self.verify_launch_paths()?;
@@ -452,10 +452,12 @@ impl Config {
         cmd.env_clear()
             .envs(controlled_env(self.provider, |name| env::var_os(name)))
             .current_dir(&self.workspace);
-        if !cmd.get_envs().any(|(name, value)| {
-            name == "OPENAI_API_KEY" && value.is_some_and(|value| !value.is_empty())
-        }) {
-            return Err("Codex review requires OPENAI_API_KEY in the launch environment".into());
+        let key = self.provider.credential_name();
+        if !cmd
+            .get_envs()
+            .any(|(name, value)| name == key && value.is_some_and(|value| !value.is_empty()))
+        {
+            return Err(format!("live review requires {key} in the launch environment").into());
         }
         Ok(cmd)
     }

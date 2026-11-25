@@ -23,8 +23,7 @@ choice grants shell execution, filesystem writes, network permission, or
 persistent access. Unrecognized, unrelated and duplicate requests never
 produce any permission. The request identity is tied to its JSON-RPC ID,
 thread, turn and item/call ID. Provider-generated command strings are not
-executed by lazygtd. Claude Code's existing print-mode permission behavior
-does not change.
+executed by lazygtd. Claude review uses its own separate opt-in mode below.
 
 The optional `read_approved_note` dynamic tool is narrow, not a filesystem
 grant. It takes no arguments. The operator selects an absolute local UTF-8
@@ -46,3 +45,30 @@ protocol, the run fails without falling back to a less restricted adapter.
 
 Protocol: [OpenAI Codex app-server](https://learn.chatgpt.com/docs/app-server#approvals)
 and [dynamic tool schema](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/schema/typescript/v2/DynamicToolCallParams.ts).
+
+
+### Claude Code questions (preview)
+
+Launch with an ephemeral Claude agent config and the explicit opt-in:
+
+    lazygtd --agent-config ./agent.json --claude-review
+
+Use an official Claude Code executable and provide ANTHROPIC_API_KEY in the
+launch environment. The review process uses a temporary private profile and
+working directory; it does not load your normal Claude login, settings, hooks,
+project files or session history. This is not an operating-system sandbox, and
+system-managed provider policy can still apply. Managed or incompatible tool
+rosters fail closed. The existing Claude dispatch outside review is unchanged.
+
+The only enabled interactive tool is AskUserQuestion. A matching live
+request appears in the footer; open it with !. The overlay shows safe
+single-line question text where possible. Press n or Esc to decline, or c to
+stop that Claude turn. There is no positive approval or free-text tool
+answer on this path, and it accepts no note, file, shell, write or network
+permission. Send follow-up instructions through the normal task composer.
+Unknown requests and repeated tool-use IDs never grant access; the per-request
+review limit is 180 seconds. The actual Claude response correlates the original
+control request ID and explicitly denies it, with interrupt set only on cancel.
+
+Protocol: [Claude Code CLI reference](https://code.claude.com/docs/en/cli-reference)
+and [Anthropic Agent SDK control transport](https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/query.py).

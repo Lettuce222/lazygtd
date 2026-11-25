@@ -26,7 +26,7 @@ not signed or notarized; checksums do not override platform trust prompts.
 
 ## Profiles and commands
 
-- `--demo` loads 46 synthetic Japanese sample tasks covering all eight boxes into an in-memory SQLite database.
+- `--demo` loads 46 synthetic Japanese sample tasks covering six visible boxes into an in-memory SQLite database.
   Everything is discarded on exit, and no disk profile is created.
 - The default work profile is persistent: Windows
   `%LOCALAPPDATA%\lazygtd\work.sqlite3`, Linux/WSL
@@ -41,13 +41,17 @@ not signed or notarized; checksums do not override platform trust prompts.
   use the default protected local profile, or a private user-owned directory.
   There is no database encryption.
 - With no command, open the TUI. Use a terminal of at least 66 columns and
-  27 rows. `1`–`8`, `h`/`l` or Tab/Shift+Tab select a box; `j`/`k`
+  27 rows. `1`–`6`, `h`/`l` or Tab/Shift+Tab select a box; `j`/`k`
   select a row (wrapping at the ends); `c` opens an Inbox draft: first line title,
   following lines body. Ctrl+J or Shift+Enter inserts a line (if the terminal
   distinguishes it); Enter saves. `e` edits the body, `/` filters the current
   box by title/body, and Ctrl+D/U or Page Down/Up scrolls the detail.
   `f` then a number moves the task; `x`
   marks it done; `r` reloads; `?` shows help; `q` closes help or quits.
+  Next Actions includes tasks that need your review, due confirmations, and active
+  approval waits. Entries can also remain visible in their original project
+  or waiting box. Legacy review/desk data is shown in Next Actions without changes
+  to the underlying database.
   Finished items are available from the CLI, not shown in active TUI boxes.
   `Enter` focuses the instruction/reply box, `p` manages project steps, `t`
   edits planning fields, `!` opens questions, and `o` shows artifacts.
@@ -85,8 +89,8 @@ SHA256SUMS, bundled notices and GitHub build provenance, not OS signatures. When
 
 GTD box, assignee and agent run are independent. In Next, `AI ·` marks an
 agent's task. In the TUI, `a` switches assignee and `i` saves directions without
-sending anything. Try `lazygtd --demo`, press `4`, select the AI task, then press
-`s`. Or press Enter and write a follow-up directly in the reply box. This uses a fake agent, returns the task to `1 あなたの番`, and keeps it open
+sending anything. Try `lazygtd --demo`, press `2`, select the AI task, then press
+`s`. Or press Enter and write a follow-up directly in the reply box. This uses a fake agent, returns the task to `2 次の行動`, and keeps it open
 for your review.
 
 For a real run, make a local JSON file, e.g. `agent.json`:
@@ -119,8 +123,7 @@ There is no automatic launch or credential registration.
 
 The worker cannot mark a GTD task complete via its response. The app reserves
 at most one active run per task; the exit status and provider protocol
-determine the result. Both a report and a failure hand the task back to
-the human review box. Fresh setup and existing v1–v5 databases use the same v6
+determine the result. A report or failure makes the task visible in Next Actions under your responsibility. Fresh setup and existing v1–v5 databases use the same v6
 schema; older binaries cannot open a migrated database. See [storage design and spec progress](docs/spec-progress.md).
 
 These adapters are for read-only research/planning in a trusted workspace;
@@ -130,9 +133,9 @@ push or external-post adapters, and do not bypass permission prompts.
 Optional integrations:
 - [Public GitHub PR monitoring](docs/pr-watch.md) while the TUI runs.
 - [Resume an exact Codex or Claude Code session](docs/agent-sessions.md).
-- [Live, narrowly scoped Codex approvals](docs/approvals.md).
+- [Live, narrowly scoped Codex and Claude review](docs/approvals.md).
 
-Actual worktree edits, general command approvals, Claude's interactive approval flow,
+Actual worktree edits, general command approvals, unrestricted Claude approvals,
 always-on automation, and import from the old Hub are outside this scope. Real runs are foreground in the
 launching terminal; a forced process shutdown may leave an active record
 that needs manual recovery. After verifying the worker really stopped, run

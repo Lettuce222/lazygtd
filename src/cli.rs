@@ -19,6 +19,7 @@ No command: open TUI; --demo uses disposable in-memory data.
 --watch-github-curl /absolute/path/to/curl enables unauthenticated public PR checks while TUI runs.\n\
 --watch-github /absolute/path/to/gh uses an existing official GitHub CLI login instead.\n\
 --codex-review [--approved-note PATH] adds interactive Codex app-server review to --agent-config.\n\
+--claude-review shows live Claude questions/approval waits in Next Actions.\n\
 Commands: add TITLE [BODY] | edit-body ID REV BODY | list [--json] | show ID | move ID REV BOX | done ID REV\n\
 Agent: message ID REV TEXT | conversation ID | assign ID REV me|agent | instruct ID REV TEXT | agent-status ID\n\
        agent-preview ID CONFIG | agent-run ID REV CONFIG --send\n\
@@ -28,7 +29,7 @@ Plan: meta ID REV FIELD VALUE | steps PROJECT | step-add PROJECT REV TITLE [BODY
       step-order PROJECT REV ITEM... | watch-resolve ID REV CLOSED_URL...
 \
 Ask: questions [ID CHOICE] | question-import JSON | question-reply ID TEXT | question-reason ID TEXT\n\
-Boxes: review, desk, inbox, next, projects, waiting, someday, reference\n\
+Boxes: inbox, next, projects, waiting, someday, reference (review and desk are legacy IDs)\n\
 Options: --help, --version";
 
 enum Action<'a> {
@@ -88,7 +89,7 @@ struct TuiOptions<'a> {
     agent: Option<&'a str>,
     gh: Option<&'a str>,
     curl: Option<&'a str>,
-    review: bool,
+    review: Option<crate::review_agent::Provider>,
     note: Option<&'a str>,
 }
 
@@ -115,8 +116,15 @@ fn open_tui<'a>(mut flags: &[&'a str], demo: bool) -> Result<Action<'a>> {
                 options.curl = Some(value);
                 rest
             }
-            ["--codex-review", rest @ ..] if !options.review => {
-                options.review = true;
+            [flag @ ("--codex-review" | "--claude-review"), rest @ ..]
+                if options.review.is_none() =>
+            {
+                use crate::review_agent::Provider;
+                options.review = Some(if *flag == "--codex-review" {
+                    Provider::Codex
+                } else {
+                    Provider::Claude
+                });
                 rest
             }
             ["--approved-note", value, rest @ ..] if options.note.is_none() => {
@@ -126,10 +134,11 @@ fn open_tui<'a>(mut flags: &[&'a str], demo: bool) -> Result<Action<'a>> {
             _ => return Err("invalid or duplicate TUI options; see --help".into()),
         };
     }
-    if (options.review && options.agent.is_none()) || (options.note.is_some() && !options.review) {
+    if (options.review.is_some() && options.agent.is_none())
+        || (options.note.is_some() && options.review != Some(crate::review_agent::Provider::Codex))
+    {
         return Err(
-            "--codex-review requires --agent-config; --approved-note requires --codex-review"
-                .into(),
+            "review requires --agent-config; --approved-note requires --codex-review".into(),
         );
     }
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
@@ -171,6 +180,7 @@ pub fn run(args: &[OsString]) -> Result<()> {
             | "--watch-github"
             | "--watch-github-curl"
             | "--codex-review"
+            | "--claude-review"
             | "--approved-note",
             ..,
         ] => open_tui(&rest, demo)?,
@@ -273,12 +283,13 @@ pub fn run(args: &[OsString]) -> Result<()> {
                 (None, None) => None,
                 _ => return Err("choose exactly one GitHub watch transport".into()),
             };
-            let review = if options.review {
+            let review = if let Some(provider) = options.review {
                 let config = config
                     .as_ref()
                     .ok_or("missing review agent configuration")?;
                 Some(crate::review_agent::Settings::new(
                     config,
+                    provider,
                     options.note.map(std::path::Path::new),
                 )?)
             } else {
