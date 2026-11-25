@@ -4,7 +4,6 @@ on:
     branches: [main]
   push:
     branches: [main]
-    tags: ['v*']
   workflow_dispatch:
 permissions:
   contents: read
@@ -14,6 +13,29 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  release-plan:
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Resolve the Cargo version
+        run: cargo metadata --locked --no-deps --format-version 1 > cargo-metadata.json
+      - name: Plan a release only for a new version
+        id: version
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq '.[] | select(.draft == false) | .tag_name' > published-tags
+          tag=$(python3 .github/scripts/release_plan.py cargo-metadata.json published-tags)
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+
   lint:
     runs-on: ubuntu-22.04
     timeout-minutes: 15
@@ -28,6 +50,8 @@ jobs:
           cargo clippy --locked --all-targets -- -D warnings
 
   build:
+    needs: [release-plan]
+    if: ${{ !cancelled() && (needs.release-plan.result == 'success' || needs.release-plan.result == 'skipped') }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -56,7 +80,7 @@ jobs:
     env:
       BUILD_TARGET: ${{ matrix.target }}
       PLATFORM: ${{ matrix.platform }}
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ needs.release-plan.outputs.tag }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -91,20 +115,20 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --release --locked --target $env:BUILD_TARGET
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Smoke test and package tagged Unix build
-        if: runner.os != 'Windows' && matrix.platform != 'macos-arm64' && startsWith(github.ref, 'refs/tags/v')
+      - name: Smoke test and package release Unix build
+        if: runner.os != 'Windows' && matrix.platform != 'macos-arm64' && needs.release-plan.outputs.tag != ''
         shell: bash
         run: python3 .github/scripts/package.py --tag "$TAG" --platform "$PLATFORM" --target "$BUILD_TARGET"
-      - name: Verify architecture and package tagged Apple Silicon build
-        if: matrix.platform == 'macos-arm64' && startsWith(github.ref, 'refs/tags/v')
+      - name: Verify architecture and package release Apple Silicon build
+        if: matrix.platform == 'macos-arm64' && needs.release-plan.outputs.tag != ''
         shell: bash
         run: python3 .github/scripts/package.py --tag "$TAG" --platform "$PLATFORM" --target "$BUILD_TARGET" --cross-apple-silicon
-      - name: Smoke test and package tagged Windows build
-        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
+      - name: Smoke test and package release Windows build
+        if: runner.os == 'Windows' && needs.release-plan.outputs.tag != ''
         shell: pwsh
         run: python .github/scripts/package.py --tag $env:TAG --platform $env:PLATFORM --target $env:BUILD_TARGET
       - name: Keep checked binaries from branch builds
-        if: "!startsWith(github.ref, 'refs/tags/v')"
+        if: needs.release-plan.outputs.tag == ''
         shell: bash
         run: |
           set -euo pipefail
@@ -119,10 +143,10 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.ref == 'refs/heads/main' && needs.release-plan.outputs.tag != ''
     runs-on: ubuntu-22.04
     timeout-minutes: 10
-    needs: [lint, build]
+    needs: [release-plan, lint, build]
     permissions:
       contents: write
       id-token: write
@@ -135,7 +159,7 @@ jobs:
       - name: Generate checksums
         working-directory: dist
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.release-plan.outputs.tag }}
         run: |
           set -euo pipefail
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-preview\.[0-9]+)?$ ]]
@@ -153,13 +177,27 @@ jobs:
       - name: Publish checked GitHub Release
         working-directory: dist
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.release-plan.outputs.tag }}
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           sha256sum -c --strict SHA256SUMS
           mapfile -t assets < <(cut -d ' ' -f 3 SHA256SUMS)
+          [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          remote="https://github.com/$GH_REPO.git"
+          if refs=$(git ls-remote --exit-code --tags "$remote" "refs/tags/$TAG" "refs/tags/$TAG^{}"); then
+            object=$(awk -v ref="refs/tags/$TAG^{}" '$2 == ref { print $1 }' <<< "$refs")
+            if [[ -z "$object" ]]; then
+              object=$(awk -v ref="refs/tags/$TAG" '$2 == ref { print $1 }' <<< "$refs")
+            fi
+            [[ "$object" == "$RELEASE_SHA" ]] || { echo "Existing $TAG points to a different commit" >&2; exit 1; }
+          else
+            status=$?
+            [[ "$status" == 2 ]] || exit "$status"
+            gh api --method POST "repos/$GH_REPO/git/refs" -f ref="refs/tags/$TAG" -f sha="$RELEASE_SHA" --silent
+          fi
           flags=()
           if [[ "$TAG" == *-preview.* ]]; then flags+=(--prerelease); fi
           gh release create "$TAG" "${assets[@]}" SHA256SUMS \
