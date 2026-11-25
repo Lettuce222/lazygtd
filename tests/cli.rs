@@ -32,11 +32,46 @@ impl Temp {
             .output()
             .unwrap()
     }
+
+    fn run_stdin(&self, args: &[&str], input: &[u8]) -> Output {
+        use std::io::Write;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_lazygtd"))
+            .env_clear()
+            .env("HOME", &self.0)
+            .env("LOCALAPPDATA", &self.0)
+            .env("XDG_DATA_HOME", &self.0)
+            .current_dir(&self.0)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    fn events(&self, id: i64) -> Vec<(i64, String, String)> {
+        let c = rusqlite::Connection::open(self.0.join("agent.db")).unwrap();
+        c.prepare("SELECT revision,kind,actor FROM event WHERE item_id=? ORDER BY revision")
+            .unwrap()
+            .query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
 }
 impl Drop for Temp {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+fn fails(out: Output, message: &str) -> Output {
+    assert!(!out.status.success(), "unexpected success");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(message), "{stderr}");
+    out
 }
 
 fn json(out: Output) -> Value {
@@ -312,4 +347,271 @@ fn database_can_live_under_os_ancestor_alias_but_not_a_symlinked_leaf() {
             .status
             .success()
     );
+}
+
+const DB: [&str; 2] = ["--db", "agent.db"];
+
+fn db<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    DB.iter().chain(args).copied().collect()
+}
+
+#[test]
+fn add_creates_box_assignee_and_planning_at_once_or_nothing() {
+    let t = Temp::new();
+    let item = json(t.run(&db(&[
+        "add",
+        "wait for the reviewer",
+        "--box",
+        "waiting",
+        "--assignee",
+        "agent",
+        "--meta",
+        "who=reviewer",
+        "--meta",
+        "since=2026-01-02",
+        "--meta",
+        "source=https://example.invalid/thread/1",
+        "--meta",
+        "links=https://example.invalid/a",
+        "--meta",
+        "links=https://example.invalid/b",
+        "--by",
+        "importer",
+    ])));
+    assert_eq!(item["revision"], 1);
+    assert_eq!(item["box_id"], "waiting");
+    assert_eq!(item["assignee"], "agent");
+    assert_eq!(item["archived"], false);
+    assert_eq!(item["planning"]["who"], "reviewer");
+    assert_eq!(item["planning"]["since"], "2026-01-02");
+    assert_eq!(
+        item["planning"]["source"],
+        "https://example.invalid/thread/1"
+    );
+    assert_eq!(
+        item["planning"]["links"],
+        serde_json::json!(["https://example.invalid/a", "https://example.invalid/b"])
+    );
+    assert_eq!(t.events(1), [(1, "add".into(), "agent:importer".into())]);
+
+    for (args, message) in [
+        (
+            vec!["add", "x", "--box", "next", "--meta", "who=someone"],
+            "waiting fields",
+        ),
+        (
+            vec!["add", "x", "--meta", "due=2026-02-30"],
+            "calendar date",
+        ),
+        (
+            vec!["add", "x", "--meta", "nonsense=1"],
+            "unknown planning field",
+        ),
+        (vec!["add", "x", "--meta", "due"], "KEY=VALUE"),
+        (vec!["add", "x", "--box", "nowhere"], "unknown box"),
+        (vec!["add", "x", "--assignee", "robot"], "assignee"),
+        (vec!["add", "x", "--by", "has space"], "--by NAME"),
+        (vec!["add", "x", "--by", "a", "--by", "b"], "more than once"),
+        (vec!["add", "x", "--with", "steps"], "does not take --with"),
+        (vec!["add", "x", "--body", "text"], "--body only accepts -"),
+        (vec!["add", "x", "body", "--body-file", "f"], "only once"),
+    ] {
+        fails(t.run(&db(&args)), message);
+    }
+    assert_eq!(
+        json(t.run(&db(&["list", "--json", "--all"])))
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn bodies_from_file_and_stdin_match_the_argument() {
+    let t = Temp::new();
+    let body = "## 見出し\n\n- \"quoted\" and 'single' $HOME `tick`\n- 二行目\n\n```sh\necho -n --body\n```\n";
+    std::fs::write(t.0.join("body.md"), body).unwrap();
+    let from_arg = json(t.run(&db(&["add", "arg", body])));
+    let from_file = json(t.run(&db(&["add", "file", "--body-file", "body.md"])));
+    let from_stdin = json(t.run_stdin(&db(&["add", "stdin", "--body", "-"]), body.as_bytes()));
+    assert_eq!(from_arg["body"], body);
+    assert_eq!(from_file["body"], body);
+    assert_eq!(from_stdin["body"], body);
+
+    let edited = json(t.run_stdin(&db(&["edit-body", "1", "1", "-"]), b"new\r\nbody"));
+    assert_eq!(edited["body"], "new\nbody");
+    assert_eq!(edited["revision"], 2);
+    let edited = json(t.run(&db(&[
+        "edit-body",
+        "1",
+        "2",
+        "--body-file",
+        "body.md",
+        "--by",
+        "bot",
+    ])));
+    assert_eq!(edited["body"], body);
+    let edited = json(t.run(&db(&["edit-body", "1", "3", "plain argument"])));
+    assert_eq!(edited["body"], "plain argument");
+    fails(t.run(&db(&["edit-body", "1", "4"])), "edit-body needs");
+    fails(t.run(&db(&["add", "x", "--body-file", "missing.md"])), "");
+    std::fs::write(t.0.join("big.md"), "a".repeat(32_001)).unwrap();
+    fails(
+        t.run(&db(&["add", "x", "--body-file", "big.md"])),
+        "exceeds 32000",
+    );
+    fails(
+        t.run_stdin(&db(&["add", "x", "--body", "-"]), &[0xff, 0xfe]),
+        "UTF-8",
+    );
+
+    let project = json(t.run(&db(&["add", "project", "--box", "projects"])));
+    let id = project["id"].as_i64().unwrap().to_string();
+    json(t.run_stdin(
+        &db(&["step-add", &id, "1", "step", "--body", "-"]),
+        body.as_bytes(),
+    ));
+    let step = &json(t.run(&db(&["show", &id, "--with", "steps"])))["steps"][0];
+    let step = json(t.run(&db(&["show", &step["id"].as_i64().unwrap().to_string()])));
+    assert_eq!(step["body"], body);
+    assert_eq!(
+        t.events(1).into_iter().map(|e| e.2).collect::<Vec<_>>(),
+        ["user", "user", "agent:bot", "user"]
+    );
+}
+
+#[test]
+fn retitle_archive_reopen_and_reply_check_revisions() {
+    let t = Temp::new();
+    json(t.run(&db(&["add", "draft title"])));
+    assert_eq!(
+        t.run(&db(&["retitle", "1", "2", "x"])).status.code(),
+        Some(3)
+    );
+    let item = json(t.run(&db(&["retitle", "1", "1", "final title", "--by", "bot"])));
+    assert_eq!(
+        (item["title"].as_str(), item["revision"].as_i64()),
+        (Some("final title"), Some(2))
+    );
+
+    fails(t.run(&db(&["reply", "1", "2", "text"])), "--as agent");
+    fails(
+        t.run(&db(&["reply", "1", "2", "--as", "user", "text"])),
+        "--as agent",
+    );
+    assert_eq!(
+        t.run(&db(&["reply", "1", "1", "--as", "agent", "x"]))
+            .status
+            .code(),
+        Some(3)
+    );
+    let item = json(t.run_stdin(
+        &db(&["reply", "1", "2", "--as", "agent", "-", "--by", "bot"]),
+        "調べた結果です。\n".as_bytes(),
+    ));
+    assert_eq!(item["unread_reply"], true);
+    assert_eq!(item["pending_message"], false);
+    let shown = json(t.run(&db(&["show", "1", "--with", "conversation"])));
+    assert_eq!(shown["conversation"][0]["role"], "agent");
+    assert_eq!(shown["conversation"][0]["body"], "調べた結果です。");
+    assert_eq!(shown["conversation"][0]["read"], false);
+    assert!(shown["conversation"][0]["run_id"].is_null());
+    assert!(shown.get("steps").is_none());
+    assert_eq!(shown["title"], "final title");
+
+    assert_eq!(t.run(&db(&["archive", "1", "2"])).status.code(), Some(3));
+    let item = json(t.run(&db(&["archive", "1", "3", "--by", "bot"])));
+    assert_eq!(item["archived"], true);
+    assert_eq!(item["done"], false);
+    assert_eq!(json(t.run(&db(&["list", "--json"]))), serde_json::json!([]));
+    assert_eq!(json(t.run(&db(&["list", "--json", "--all"])))[0]["id"], 1);
+    assert!(String::from_utf8_lossy(&t.run(&db(&["list", "--all"])).stdout).contains("archived"));
+    fails(t.run(&db(&["retitle", "1", "4", "again"])), "archived");
+    assert_eq!(t.run(&db(&["reopen", "1", "3"])).status.code(), Some(3));
+    let item = json(t.run(&db(&["reopen", "1", "4"])));
+    assert_eq!(item["archived"], false);
+    assert_eq!(item["box_id"], "inbox");
+    json(t.run(&db(&["move", "1", "5", "next"])));
+    json(t.run(&db(&["done", "1", "6"])));
+    let item = json(t.run(&db(&["reopen", "1", "7", "--by", "bot"])));
+    assert_eq!(
+        (item["done"].as_bool(), item["box_id"].as_str()),
+        (Some(false), Some("next"))
+    );
+    assert_eq!(
+        t.events(1),
+        [
+            (1, "add".into(), "user".into()),
+            (2, "retitle".into(), "agent:bot".into()),
+            (3, "reply".into(), "agent:bot".into()),
+            (4, "archive".into(), "agent:bot".into()),
+            (5, "reopen".into(), "user".into()),
+            (6, "move".into(), "user".into()),
+            (7, "done".into(), "user".into()),
+            (8, "reopen".into(), "agent:bot".into()),
+        ]
+    );
+}
+
+#[test]
+fn list_filters_and_show_with_steps_and_conversation() {
+    let t = Temp::new();
+    json(t.run(&db(&["add", "inbox mine"])));
+    json(t.run(&db(&[
+        "add",
+        "next agent",
+        "--box",
+        "next",
+        "--assignee",
+        "agent",
+    ])));
+    json(t.run(&db(&["add", "next mine", "--box", "next"])));
+    json(t.run(&db(&["done", "3", "1"])));
+    json(t.run(&db(&["add", "archived", "--box", "next"])));
+    json(t.run(&db(&["archive", "4", "1"])));
+    let ids = |args: &[&str]| {
+        let mut all = vec!["list", "--json"];
+        all.extend(args);
+        json(t.run(&db(&all)))
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["id"].as_i64().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&[]), [1, 2, 3]);
+    assert_eq!(ids(&["--all"]), [1, 2, 3, 4]);
+    assert_eq!(ids(&["--box", "next"]), [2, 3]);
+    assert_eq!(ids(&["--box", "next", "--all"]), [2, 3, 4]);
+    assert_eq!(ids(&["--assignee", "agent"]), [2]);
+    assert_eq!(ids(&["--done"]), [3]);
+    assert_eq!(ids(&["--open"]), [1, 2]);
+    assert_eq!(ids(&["--open", "--all"]), [1, 2, 4]);
+    fails(
+        t.run(&db(&["list", "--done", "--open"])),
+        "either --done or --open",
+    );
+    fails(t.run(&db(&["list", "--box", "desk2"])), "unknown box");
+    fails(t.run(&db(&["list", "--by", "bot"])), "does not take --by");
+
+    let project = json(t.run(&db(&["add", "project", "--box", "projects"])));
+    let id = project["id"].as_i64().unwrap().to_string();
+    json(t.run(&db(&["step-add", &id, "1", "first", "--by", "bot"])));
+    json(t.run(&db(&["message", &id, "2", "please plan"])));
+    let shown = json(t.run(&db(&["show", &id, "--with", "conversation,steps"])));
+    assert_eq!(shown["id"], project["id"]);
+    assert_eq!(shown["revision"], 3);
+    assert_eq!(shown["steps"][0]["title"], "first");
+    assert_eq!(shown["steps"][0]["state"], "next");
+    assert_eq!(shown["conversation"][0]["role"], "user");
+    assert_eq!(shown["conversation"][0]["body"], "please plan");
+    assert_eq!(json(t.run(&db(&["show", &id]))).get("steps"), None);
+    fails(
+        t.run(&db(&["show", &id, "--with", "events"])),
+        "--with takes",
+    );
+    // `--` keeps option-like text positional.
+    let odd = json(t.run(&db(&["add", "--", "--json"])));
+    assert_eq!(odd["title"], "--json");
 }

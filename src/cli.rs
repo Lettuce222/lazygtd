@@ -7,7 +7,10 @@ use std::{
     path::PathBuf,
 };
 
-use crate::store::{BOX_IDS, Sqlite, Store, StoreError};
+use serde::Serialize;
+
+use crate::planning::PlanField;
+use crate::store::{BOX_IDS, Item, NewItem, Sqlite, Store, StoreError};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -20,22 +23,34 @@ No command: open TUI; --demo uses disposable in-memory data.
 --watch-github /absolute/path/to/gh uses an existing official GitHub CLI login instead.\n\
 --codex-review [--approved-note PATH] adds interactive Codex app-server review to --agent-config.\n\
 --claude-review shows live Claude questions/approval waits in Next Actions.\n\
-Commands: add TITLE [BODY] | edit-body ID REV BODY | list [--json] | show ID | move ID REV BOX | done ID REV\n\
-Agent: message ID REV TEXT | conversation ID | assign ID REV me|agent | instruct ID REV TEXT | agent-status ID\n\
+Commands: add TITLE [BODY] [--box BOX] [--assignee me|agent] [--meta KEY=VALUE]...\n\
+          edit-body ID REV (BODY | -) | retitle ID REV TITLE | move ID REV BOX\n\
+          done ID REV | archive ID REV | reopen ID REV\n\
+          list [--json] [--box BOX] [--assignee me|agent] [--done | --open] [--all]\n\
+          show ID [--with conversation,steps]\n\
+Agent: message ID REV TEXT | reply ID REV --as agent (TEXT | -) | conversation ID\n\
+       assign ID REV me|agent | instruct ID REV TEXT | agent-status ID\n\
        agent-preview ID CONFIG | agent-run ID REV CONFIG --send\n\
        --demo agent-simulate ID REV\n\
 Plan: meta ID REV FIELD VALUE | steps PROJECT | step-add PROJECT REV TITLE [BODY]\n\
       step-attach PROJECT REV ITEM ITEM_REV | step-detach PROJECT REV ITEM ITEM_REV\n\
       step-order PROJECT REV ITEM... | watch-resolve ID REV CLOSED_URL...
 \
+      Fields: due follow_up who then watch outcome short links since source\n\
+Body: --body-file PATH or --body - (standard input) for add, edit-body, step-add, reply.\n\
+Writes: --by NAME records the change as agent:NAME. -- ends options.\n\
 Ask: questions [ID CHOICE] | question-import JSON | question-reply ID TEXT | question-reason ID TEXT\n\
 Boxes: inbox, next, projects, waiting, someday, reference (review and desk are legacy IDs)\n\
 Options: --help, --version";
 
+/// Upper bound for a body read from a file or standard input; the store's own
+/// limit is checked again after reading.
+const BODY_LIMIT: u64 = 32_000;
+
 enum Action<'a> {
-    Meta(i64, i64, crate::planning::PlanField, &'a str),
+    Meta(i64, i64, PlanField, &'a str),
     Steps(i64),
-    StepAdd(i64, i64, &'a str, &'a str),
+    StepAdd(i64, i64, &'a str, String),
     StepLink(bool, i64, i64, i64, i64),
     StepOrder(i64, i64, Vec<i64>),
     Calendar(i64, i64),
@@ -46,13 +61,17 @@ enum Action<'a> {
     Watch(i64, i64, Vec<&'a str>),
     Answer(i64, u8),
     Tui(TuiOptions<'a>),
-    Add(&'a str, &'a str),
-    EditBody(i64, i64, &'a str),
-    List(bool),
-    Show(i64),
+    Add(NewItem<'a>, String),
+    EditBody(i64, i64, String),
+    Retitle(i64, i64, &'a str),
+    List(bool, ListFilter<'a>),
+    Show(i64, With),
     Move(i64, i64, &'a str),
     Done(i64, i64),
+    Archive(i64, i64),
+    Reopen(i64, i64),
     Message(i64, i64, &'a str),
+    Reply(i64, i64, String),
     Conversation(i64),
     Assign(i64, i64, &'a str),
     Instruct(i64, i64, &'a str),
@@ -61,6 +80,249 @@ enum Action<'a> {
     AgentRun(i64, i64, &'a str),
     Simulate(i64, i64),
 }
+
+/// Options shared by commands. Only these exact spellings are options; any
+/// other argument (or everything after `--`) stays positional.
+#[derive(Default)]
+struct Flags<'a> {
+    seen: Vec<&'static str>,
+    json: bool,
+    by: Option<&'a str>,
+    box_id: Option<&'a str>,
+    assignee: Option<&'a str>,
+    meta: Vec<&'a str>,
+    body_file: Option<&'a str>,
+    body_stdin: bool,
+    as_role: Option<&'a str>,
+    with: Option<&'a str>,
+    all: bool,
+    done: bool,
+    open: bool,
+}
+
+const VALUE_FLAGS: [&str; 8] = [
+    "--by",
+    "--box",
+    "--assignee",
+    "--meta",
+    "--body-file",
+    "--body",
+    "--as",
+    "--with",
+];
+const SWITCHES: [&str; 4] = ["--json", "--all", "--done", "--open"];
+
+impl<'a> Flags<'a> {
+    fn split(args: &[&'a str]) -> Result<(Vec<&'a str>, Self)> {
+        let mut flags = Self::default();
+        let mut positional = Vec::new();
+        let mut rest = args.iter();
+        while let Some(&arg) = rest.next() {
+            if arg == "--" {
+                positional.extend(rest.by_ref().copied());
+                break;
+            }
+            if let Some(&name) = SWITCHES.iter().find(|&&f| f == arg) {
+                flags.mark(name)?;
+                match name {
+                    "--json" => flags.json = true,
+                    "--all" => flags.all = true,
+                    "--done" => flags.done = true,
+                    _ => flags.open = true,
+                }
+            } else if let Some(&name) = VALUE_FLAGS.iter().find(|&&f| f == arg) {
+                let value = *rest
+                    .next()
+                    .ok_or_else(|| format!("{name} needs a value; see --help"))?;
+                if name != "--meta" {
+                    flags.mark(name)?;
+                }
+                match name {
+                    "--by" => flags.by = Some(value),
+                    "--box" => flags.box_id = Some(value),
+                    "--assignee" => flags.assignee = Some(value),
+                    "--meta" => {
+                        flags.seen.push(name);
+                        flags.meta.push(value);
+                    }
+                    "--body-file" => flags.body_file = Some(value),
+                    "--body" if value == "-" => flags.body_stdin = true,
+                    "--body" => {
+                        return Err("--body only accepts - (standard input); \
+                                    pass text as an argument or use --body-file"
+                            .into());
+                    }
+                    "--as" => flags.as_role = Some(value),
+                    _ => flags.with = Some(value),
+                }
+            } else {
+                positional.push(arg);
+            }
+        }
+        Ok((positional, flags))
+    }
+
+    fn mark(&mut self, name: &'static str) -> Result<()> {
+        if self.seen.contains(&name) {
+            return Err(format!("{name} given more than once").into());
+        }
+        self.seen.push(name);
+        Ok(())
+    }
+
+    /// Reject options the command does not take.
+    fn allow(&self, command: &str, allowed: &[&str]) -> Result<()> {
+        match self.seen.iter().find(|f| !allowed.contains(f)) {
+            Some(flag) => Err(format!("{command} does not take {flag}; see --help").into()),
+            None => Ok(()),
+        }
+    }
+
+    fn actor(&self, default: &str) -> Result<String> {
+        let Some(name) = self.by else {
+            return Ok(default.into());
+        };
+        if name.is_empty()
+            || name.len() > 64
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            return Err("--by NAME must be 1–64 ASCII letters, digits, '-', '_' or '.'".into());
+        }
+        Ok(format!("agent:{name}"))
+    }
+
+    /// The body from the argument, `-`/`--body -` (standard input) or `--body-file`.
+    fn body(&self, argument: Option<&str>, dash_reads_stdin: bool) -> Result<Option<String>> {
+        let stdin = self.body_stdin || (dash_reads_stdin && argument == Some("-"));
+        let argument = argument.filter(|a| !(dash_reads_stdin && *a == "-"));
+        let sources = usize::from(stdin)
+            + usize::from(self.body_file.is_some())
+            + usize::from(argument.is_some());
+        if sources > 1 {
+            return Err(
+                "give the body only once: as an argument, from - or with --body-file".into(),
+            );
+        }
+        if stdin {
+            return read_body(std::io::stdin().lock(), "standard input").map(Some);
+        }
+        if let Some(path) = self.body_file {
+            return read_body(fs::File::open(path)?, path).map(Some);
+        }
+        Ok(argument.map(str::to_owned))
+    }
+
+    fn filter(&self) -> Result<ListFilter<'a>> {
+        if let Some(b) = self.box_id
+            && !BOX_IDS.contains(&b)
+        {
+            return Err("unknown box; see --help".into());
+        }
+        if let Some(a) = self.assignee
+            && !["me", "agent"].contains(&a)
+        {
+            return Err("assignee must be me or agent".into());
+        }
+        if self.done && self.open {
+            return Err("choose either --done or --open".into());
+        }
+        Ok(ListFilter {
+            box_id: self.box_id,
+            assignee: self.assignee,
+            done: if self.done {
+                Some(true)
+            } else if self.open {
+                Some(false)
+            } else {
+                None
+            },
+            all: self.all,
+        })
+    }
+
+    fn meta(&self) -> Result<Vec<(PlanField, String)>> {
+        let mut out: Vec<(PlanField, String)> = Vec::new();
+        for pair in &self.meta {
+            let (key, value) = pair
+                .split_once('=')
+                .ok_or("--meta takes KEY=VALUE; see --help")?;
+            let field = PlanField::parse(key)?;
+            // Links are one URL per line; repeating --meta links=URL adds a line.
+            match out.iter_mut().find(|(f, _)| *f == field) {
+                Some((PlanField::Links, joined)) => {
+                    joined.push('\n');
+                    joined.push_str(value);
+                }
+                _ => out.push((field, value.to_owned())),
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn read_body(source: impl Read, name: &str) -> Result<String> {
+    let mut bytes = Vec::new();
+    source.take(BODY_LIMIT + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > BODY_LIMIT {
+        return Err(format!("body from {name} exceeds {BODY_LIMIT} bytes").into());
+    }
+    String::from_utf8(bytes).map_err(|_| format!("body from {name} must be UTF-8").into())
+}
+
+#[derive(Default)]
+struct ListFilter<'a> {
+    box_id: Option<&'a str>,
+    assignee: Option<&'a str>,
+    done: Option<bool>,
+    all: bool,
+}
+
+impl ListFilter<'_> {
+    fn keeps(&self, item: &Item) -> bool {
+        self.box_id.is_none_or(|b| item.box_id == b)
+            && self.assignee.is_none_or(|a| item.assignee == a)
+            && self.done.is_none_or(|d| item.done == d)
+    }
+}
+
+#[derive(Default)]
+struct With {
+    conversation: bool,
+    steps: bool,
+}
+
+impl With {
+    fn parse(value: Option<&str>) -> Result<Self> {
+        let mut with = Self::default();
+        for part in value.into_iter().flat_map(|v| v.split(',')) {
+            match part.trim() {
+                "conversation" => with.conversation = true,
+                "steps" => with.steps = true,
+                _ => return Err("--with takes conversation and/or steps, comma-separated".into()),
+            }
+        }
+        Ok(with)
+    }
+}
+
+/// `show --with`: the item's own fields plus the requested lists.
+#[derive(Serialize)]
+struct Shown {
+    #[serde(flatten)]
+    item: Item,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conversation: Option<Vec<crate::talk::Message>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    steps: Option<Vec<crate::planning::Step>>,
+}
+
+fn print_json(value: &impl Serialize) -> Result<()> {
+    println!("{}", serde_json::to_string(value)?);
+    Ok(())
+}
+
 fn number(s: &str) -> Result<i64> {
     match s.parse::<i64>() {
         Ok(n) if n > 0 => Ok(n),
@@ -173,83 +435,23 @@ pub fn run(args: &[OsString]) -> Result<()> {
         .iter()
         .map(|a| a.to_str().ok_or("command arguments must be valid UTF-8"))
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let action = match rest.as_slice() {
-        []
-        | [
+    let (action, actor) = if matches!(
+        rest.as_slice(),
+        [] | [
             "--agent-config"
-            | "--watch-github"
-            | "--watch-github-curl"
-            | "--codex-review"
-            | "--claude-review"
-            | "--approved-note",
+                | "--watch-github"
+                | "--watch-github-curl"
+                | "--codex-review"
+                | "--claude-review"
+                | "--approved-note",
             ..,
-        ] => open_tui(&rest, demo)?,
-        ["add", title] => Action::Add(title, ""),
-        ["add", title, body] => Action::Add(title, body),
-        ["edit-body", id, rev, body] => Action::EditBody(number(id)?, number(rev)?, body),
-        ["list"] => Action::List(false),
-        ["list", "--json"] => Action::List(true),
-        ["show", id] => Action::Show(number(id)?),
-        ["move", id, rev, dest] if BOX_IDS.contains(dest) => {
-            Action::Move(number(id)?, number(rev)?, dest)
-        }
-        ["done", id, rev] => Action::Done(number(id)?, number(rev)?),
-        ["meta", id, rev, field, value] => Action::Meta(
-            number(id)?,
-            number(rev)?,
-            crate::planning::PlanField::parse(field)?,
-            value,
-        ),
-        ["steps", id] => Action::Steps(number(id)?),
-        ["step-add", id, rev, title] => Action::StepAdd(number(id)?, number(rev)?, title, ""),
-        ["step-add", id, rev, title, body] => {
-            Action::StepAdd(number(id)?, number(rev)?, title, body)
-        }
-        [
-            cmd @ ("step-attach" | "step-detach"),
-            id,
-            rev,
-            step,
-            step_rev,
-        ] => Action::StepLink(
-            *cmd == "step-attach",
-            number(id)?,
-            number(rev)?,
-            number(step)?,
-            number(step_rev)?,
-        ),
-        ["step-order", id, rev, values @ ..] => Action::StepOrder(
-            number(id)?,
-            number(rev)?,
-            values.iter().map(|x| number(x)).collect::<Result<_>>()?,
-        ),
-        ["watch-resolve", id, rev, urls @ ..] => {
-            Action::Watch(number(id)?, number(rev)?, urls.to_vec())
-        }
-        ["calendar-action", id, rev] => Action::Calendar(number(id)?, number(rev)?),
-        ["agent-recover", id, run, "--confirmed-stopped"] if !demo => {
-            Action::Recover(number(id)?, number(run)?)
-        }
-        ["questions"] => Action::Questions,
-        ["question-import", path] if !demo => Action::QuestionImport(path),
-        [key @ ("question-reply" | "question-reason"), id, value] => {
-            Action::AnswerText(number(id)?, *key == "question-reason", value)
-        }
-        ["questions", id, choice] => Action::Answer(number(id)?, choice.parse()?),
-        ["message", id, rev, body] => Action::Message(number(id)?, number(rev)?, body),
-        ["conversation", id] => Action::Conversation(number(id)?),
-        ["assign", id, rev, who] => Action::Assign(number(id)?, number(rev)?, who),
-        ["instruct", id, rev, instructions] => {
-            Action::Instruct(number(id)?, number(rev)?, instructions)
-        }
-        ["agent-status", id] => Action::AgentStatus(number(id)?),
-        ["agent-preview", id, config] if !demo => Action::AgentPreview(number(id)?, config),
-        ["agent-run", id, rev, config, "--send"] if !demo => {
-            Action::AgentRun(number(id)?, number(rev)?, config)
-        }
-        ["agent-simulate", id, rev] if demo => Action::Simulate(number(id)?, number(rev)?),
-        _ => return Err("unsupported arguments; see --help".into()),
+        ]
+    ) {
+        (open_tui(&rest, demo)?, String::new())
+    } else {
+        parse(&rest, demo)?
     };
+    let actor = actor.as_str();
 
     let mut profile_path = None;
     let mut store = if demo {
@@ -297,61 +499,76 @@ pub fn run(args: &[OsString]) -> Result<()> {
             };
             crate::tui(Box::new(store), demo, profile_path, config, watcher, review)?;
         }
-        Action::Add(title, body) => println!(
-            "{}",
-            serde_json::to_string(&store.add_with_body(title, body, "user")?)?
-        ),
-        Action::EditBody(id, rev, body) => println!(
-            "{}",
-            serde_json::to_string(&store.edit_body(id, rev, body)?)?
-        ),
-        Action::List(true) => println!("{}", serde_json::to_string(&store.list()?)?),
-        Action::List(false) => {
-            for item in store.list()? {
-                println!(
-                    "{} r{} [{}{}] [{}] {}",
-                    item.id,
-                    item.revision,
-                    item.box_id,
-                    if item.done { " done" } else { "" },
-                    item.assignee,
-                    item.title
-                );
+        Action::Add(new, body) => print_json(&store.create(&NewItem {
+            body: &body,
+            actor,
+            ..new
+        })?)?,
+        Action::EditBody(id, rev, body) => print_json(&store.edit_body(id, rev, &body, actor)?)?,
+        Action::Retitle(id, rev, title) => print_json(&store.retitle(id, rev, title, actor)?)?,
+        Action::List(json, filter) => {
+            let items = if filter.all {
+                store.list_all()?
+            } else {
+                store.list()?
+            };
+            let items = items.into_iter().filter(|i| filter.keeps(i));
+            if json {
+                print_json(&items.collect::<Vec<_>>())?;
+            } else {
+                for item in items {
+                    println!(
+                        "{} r{} [{}{}{}] [{}] {}",
+                        item.id,
+                        item.revision,
+                        item.box_id,
+                        if item.done { " done" } else { "" },
+                        if item.archived { " archived" } else { "" },
+                        item.assignee,
+                        item.title
+                    );
+                }
             }
         }
-        Action::Show(id) => println!("{}", serde_json::to_string(&store.show(id)?)?),
-        Action::Move(id, rev, dest) => println!(
-            "{}",
-            serde_json::to_string(&store.move_to(id, rev, dest, "user")?)?
-        ),
-        Action::Meta(id, rev, field, value) => println!(
-            "{}",
-            serde_json::to_string(&store.change_meta(id, rev, field, value)?)?
-        ),
+        Action::Show(id, with) => {
+            let item = store.show(id)?;
+            if !with.conversation && !with.steps {
+                print_json(&item)?;
+            } else {
+                print_json(&Shown {
+                    conversation: with
+                        .conversation
+                        .then(|| store.conversation(id))
+                        .transpose()?,
+                    steps: with.steps.then(|| store.steps(id)).transpose()?,
+                    item,
+                })?;
+            }
+        }
+        Action::Move(id, rev, dest) => print_json(&store.move_to(id, rev, dest, actor)?)?,
+        Action::Done(id, rev) => print_json(&store.done(id, rev, actor)?)?,
+        Action::Archive(id, rev) => print_json(&store.archive(id, rev, actor)?)?,
+        Action::Reopen(id, rev) => print_json(&store.reopen(id, rev, actor)?)?,
+        Action::Meta(id, rev, field, value) => {
+            print_json(&store.change_meta(id, rev, field, value, actor)?)?
+        }
         Action::Steps(id) => {
             store.show(id)?;
-            println!("{}", serde_json::to_string(&store.steps(id)?)?);
+            print_json(&store.steps(id)?)?;
         }
-        Action::StepAdd(id, rev, title, body) => println!(
-            "{}",
-            serde_json::to_string(&store.add_step(id, rev, title, body)?)?
-        ),
+        Action::StepAdd(id, rev, title, body) => {
+            print_json(&store.add_step(id, rev, title, &body, actor)?)?
+        }
         Action::StepLink(attach, id, rev, step, step_rev) => {
             let item = if attach {
-                store.attach(id, rev, step, step_rev)?
+                store.attach(id, rev, step, step_rev, actor)?
             } else {
-                store.detach(id, rev, step, step_rev)?
+                store.detach(id, rev, step, step_rev, actor)?
             };
-            println!("{}", serde_json::to_string(&item)?);
+            print_json(&item)?;
         }
-        Action::StepOrder(id, rev, order) => println!(
-            "{}",
-            serde_json::to_string(&store.reorder(id, rev, &order)?)?
-        ),
-        Action::Watch(id, rev, urls) => println!(
-            "{}",
-            serde_json::to_string(&store.watch_resolve(id, rev, &urls)?)?
-        ),
+        Action::StepOrder(id, rev, order) => print_json(&store.reorder(id, rev, &order, actor)?)?,
+        Action::Watch(id, rev, urls) => print_json(&store.watch_resolve(id, rev, &urls, actor)?)?,
         Action::QuestionImport(path) => {
             let mut bytes = Vec::new();
             fs::File::open(path)?.take(65_537).read_to_end(&mut bytes)?;
@@ -373,38 +590,27 @@ pub fn run(args: &[OsString]) -> Result<()> {
             },
             crate::questions::now(),
         )?,
-        Action::Calendar(id, rev) => println!(
-            "{}",
-            serde_json::to_string(&store.calendar_action(id, rev)?)?
-        ),
+        Action::Calendar(id, rev) => print_json(&store.calendar_action(id, rev, actor)?)?,
         Action::Recover(id, run) => store.recover_agent(id, run)?,
-        Action::Questions => println!(
-            "{}",
-            serde_json::to_string(&store.questions(crate::questions::now())?)?
-        ),
+        Action::Questions => print_json(&store.questions(crate::questions::now())?)?,
         Action::Answer(id, choice) => store.answer(
             id,
             crate::questions::Answer::Choice(choice),
             crate::questions::now(),
         )?,
-        Action::Message(id, rev, body) => println!(
-            "{}",
-            serde_json::to_string(&store.send_message(id, rev, body)?)?
-        ),
+        Action::Message(id, rev, body) => print_json(&store.send_message(id, rev, body, actor)?)?,
+        Action::Reply(id, rev, body) => print_json(&store.reply(id, rev, &body, actor)?)?,
         Action::Conversation(id) => {
             store.show(id)?;
-            println!("{}", serde_json::to_string(&store.conversation(id)?)?);
+            print_json(&store.conversation(id)?)?;
         }
-        Action::Assign(id, rev, who) => {
-            println!("{}", serde_json::to_string(&store.assign(id, rev, who)?)?)
+        Action::Assign(id, rev, who) => print_json(&store.assign(id, rev, who, actor)?)?,
+        Action::Instruct(id, rev, instructions) => {
+            print_json(&store.instruct(id, rev, instructions, actor)?)?
         }
-        Action::Instruct(id, rev, instructions) => println!(
-            "{}",
-            serde_json::to_string(&store.instruct(id, rev, instructions)?)?
-        ),
         Action::AgentStatus(id) => {
             store.show(id)?;
-            println!("{}", serde_json::to_string(&store.latest_run(id)?)?);
+            print_json(&store.latest_run(id)?)?;
         }
         Action::AgentPreview(id, path) => crate::agent::preview(
             &store,
@@ -428,13 +634,142 @@ pub fn run(args: &[OsString]) -> Result<()> {
                 .into());
             }
             crate::agent::simulate(&mut store, &item)?;
-            println!("{}", serde_json::to_string(&store.latest_run(id)?)?);
-        }
-        Action::Done(id, rev) => {
-            println!("{}", serde_json::to_string(&store.done(id, rev, "user")?)?)
+            print_json(&store.latest_run(id)?)?;
         }
     }
     Ok(())
+}
+
+/// Parse a command into its action and the actor recorded for a write.
+/// Bodies from files or standard input are read here, before the database opens.
+fn parse<'a>(args: &[&'a str], demo: bool) -> Result<(Action<'a>, String)> {
+    let (positional, flags) = Flags::split(args)?;
+    let write = ["--by"];
+    let body_flags = ["--by", "--body-file", "--body"];
+    let command = positional.first().copied().unwrap_or_default();
+    let allowed: &[&str] = match command {
+        "add" => &[
+            "--by",
+            "--box",
+            "--assignee",
+            "--meta",
+            "--body-file",
+            "--body",
+        ],
+        "edit-body" | "step-add" => &body_flags,
+        "reply" => &["--by", "--body-file", "--body", "--as"],
+        "list" => &["--json", "--box", "--assignee", "--done", "--open", "--all"],
+        "show" => &["--with"],
+        "retitle" | "move" | "done" | "archive" | "reopen" | "meta" | "step-attach"
+        | "step-detach" | "step-order" | "watch-resolve" | "calendar-action" | "message"
+        | "assign" | "instruct" => &write,
+        _ => &[],
+    };
+    flags.allow(command, allowed)?;
+    let actor = flags.actor(match command {
+        "watch-resolve" => "system:watch",
+        "reply" => "agent",
+        _ => "user",
+    })?;
+    let action = match positional.as_slice() {
+        ["add", title, rest @ ..] if rest.len() <= 1 => Action::Add(
+            NewItem {
+                title,
+                box_id: flags.box_id,
+                assignee: flags.assignee,
+                meta: flags.meta()?,
+                ..NewItem::default()
+            },
+            flags
+                .body(rest.first().copied(), false)?
+                .unwrap_or_default(),
+        ),
+        ["edit-body", id, rev, rest @ ..] if rest.len() <= 1 => Action::EditBody(
+            number(id)?,
+            number(rev)?,
+            flags
+                .body(rest.first().copied(), true)?
+                .ok_or("edit-body needs BODY, - or --body-file")?,
+        ),
+        ["retitle", id, rev, title] => Action::Retitle(number(id)?, number(rev)?, title),
+        ["list"] => Action::List(flags.json, flags.filter()?),
+        ["show", id] => Action::Show(number(id)?, With::parse(flags.with)?),
+        ["move", id, rev, dest] if BOX_IDS.contains(dest) => {
+            Action::Move(number(id)?, number(rev)?, dest)
+        }
+        ["done", id, rev] => Action::Done(number(id)?, number(rev)?),
+        ["archive", id, rev] => Action::Archive(number(id)?, number(rev)?),
+        ["reopen", id, rev] => Action::Reopen(number(id)?, number(rev)?),
+        ["meta", id, rev, field, value] => {
+            Action::Meta(number(id)?, number(rev)?, PlanField::parse(field)?, value)
+        }
+        ["steps", id] => Action::Steps(number(id)?),
+        ["step-add", id, rev, title, rest @ ..] if rest.len() <= 1 => Action::StepAdd(
+            number(id)?,
+            number(rev)?,
+            title,
+            flags
+                .body(rest.first().copied(), false)?
+                .unwrap_or_default(),
+        ),
+        [
+            cmd @ ("step-attach" | "step-detach"),
+            id,
+            rev,
+            step,
+            step_rev,
+        ] => Action::StepLink(
+            *cmd == "step-attach",
+            number(id)?,
+            number(rev)?,
+            number(step)?,
+            number(step_rev)?,
+        ),
+        ["step-order", id, rev, values @ ..] => Action::StepOrder(
+            number(id)?,
+            number(rev)?,
+            values.iter().map(|x| number(x)).collect::<Result<_>>()?,
+        ),
+        ["watch-resolve", id, rev, urls @ ..] => {
+            Action::Watch(number(id)?, number(rev)?, urls.to_vec())
+        }
+        ["calendar-action", id, rev] => Action::Calendar(number(id)?, number(rev)?),
+        ["agent-recover", id, run, "--confirmed-stopped"] if !demo => {
+            Action::Recover(number(id)?, number(run)?)
+        }
+        ["questions"] => Action::Questions,
+        ["question-import", path] if !demo => Action::QuestionImport(path),
+        [key @ ("question-reply" | "question-reason"), id, value] => {
+            Action::AnswerText(number(id)?, *key == "question-reason", value)
+        }
+        ["questions", id, choice] => Action::Answer(number(id)?, choice.parse()?),
+        ["message", id, rev, body] => Action::Message(number(id)?, number(rev)?, body),
+        ["reply", id, rev, rest @ ..] if rest.len() <= 1 => {
+            if flags.as_role != Some("agent") {
+                return Err("reply needs --as agent".into());
+            }
+            Action::Reply(
+                number(id)?,
+                number(rev)?,
+                flags
+                    .body(rest.first().copied(), true)?
+                    .ok_or("reply needs TEXT, - or --body-file")?,
+            )
+        }
+        ["conversation", id] => Action::Conversation(number(id)?),
+        ["assign", id, rev, who] => Action::Assign(number(id)?, number(rev)?, who),
+        ["instruct", id, rev, instructions] => {
+            Action::Instruct(number(id)?, number(rev)?, instructions)
+        }
+        ["agent-status", id] => Action::AgentStatus(number(id)?),
+        ["agent-preview", id, config] if !demo => Action::AgentPreview(number(id)?, config),
+        ["agent-run", id, rev, config, "--send"] if !demo => {
+            Action::AgentRun(number(id)?, number(rev)?, config)
+        }
+        ["agent-simulate", id, rev] if demo => Action::Simulate(number(id)?, number(rev)?),
+        _ => return Err("unsupported arguments; see --help".into()),
+    };
+    Ok((action, actor))
 }
 
 pub fn status(e: &(dyn Error + 'static)) -> u8 {

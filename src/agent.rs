@@ -956,7 +956,7 @@ mod tests {
             let mut db = Sqlite::open(&root.join(format!("{provider}.db"))).unwrap();
             let item = db.add_with_body("synthetic", "", "user").unwrap();
             let item = db
-                .send_message(item.id, item.revision, "first task-only prompt")
+                .send_message(item.id, item.revision, "first task-only prompt", "user")
                 .unwrap();
             let result = run_verified(
                 &mut db,
@@ -971,7 +971,7 @@ mod tests {
 
             let item = db.show(item.id).unwrap();
             let item = db
-                .send_message(item.id, item.revision, "next task-only prompt")
+                .send_message(item.id, item.revision, "next task-only prompt", "user")
                 .unwrap();
             cfg["resume_session"] = json!(native);
             fs::write(&config_path, cfg.to_string()).unwrap();
@@ -996,7 +996,7 @@ mod tests {
 
             let second = db.add_with_body("unrelated", "", "user").unwrap();
             let second = db
-                .send_message(second.id, second.revision, "reject before spawn")
+                .send_message(second.id, second.revision, "reject before spawn", "user")
                 .unwrap();
             assert!(
                 run_verified(&mut db, second.id, second.revision, &config, None)
@@ -1010,7 +1010,12 @@ mod tests {
             fs::write(&config_path, cfg.to_string()).unwrap();
             let item = db.show(item.id).unwrap();
             let item = db
-                .send_message(item.id, item.revision, "mismatched result must fail")
+                .send_message(
+                    item.id,
+                    item.revision,
+                    "mismatched result must fail",
+                    "user",
+                )
                 .unwrap();
             let err = run_verified(
                 &mut db,

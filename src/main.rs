@@ -408,7 +408,7 @@ impl Desk {
             Mode::Instruct(item, draft) => match key.code {
                 KeyCode::Esc => self.mode = Mode::Desk,
                 KeyCode::Enter if !draft.trim().is_empty() => {
-                    let result = self.store.instruct(item.id, item.revision, draft);
+                    let result = self.store.instruct(item.id, item.revision, draft, "user");
                     if result.is_ok() {
                         self.mode = Mode::Desk;
                     }
@@ -423,7 +423,7 @@ impl Desk {
             Mode::EditBody(item, draft) => match key.code {
                 KeyCode::Esc => self.mode = Mode::Desk,
                 KeyCode::Enter => {
-                    let result = self.store.edit_body(item.id, item.revision, draft);
+                    let result = self.store.edit_body(item.id, item.revision, draft, "user");
                     if result.is_ok() {
                         self.mode = Mode::Desk;
                     }
@@ -454,7 +454,7 @@ impl Desk {
                     let (field, value) = draft.trim().split_once('=').unwrap_or((draft.trim(), ""));
                     let result = planning::PlanField::parse(field.trim()).and_then(|f| {
                         self.store
-                            .change_meta(item.id, item.revision, f, value.trim())
+                            .change_meta(item.id, item.revision, f, value.trim(), "user")
                     });
                     if result.is_ok() {
                         self.mode = Mode::Desk;
@@ -501,7 +501,8 @@ impl Desk {
                         let s = &steps[row];
                         let result = match key.code {
                             KeyCode::Char('d') => {
-                                self.store.detach(id, project.revision, s.id, s.revision)
+                                self.store
+                                    .detach(id, project.revision, s.id, s.revision, "user")
                             }
                             KeyCode::Char('x') => self.store.done(s.id, s.revision, "user"),
                             KeyCode::Char('J' | 'K') => {
@@ -512,7 +513,7 @@ impl Desk {
                                 };
                                 let mut order: Vec<_> = steps.iter().map(|s| s.id).collect();
                                 order.swap(row, after);
-                                self.store.reorder(id, project.revision, &order)
+                                self.store.reorder(id, project.revision, &order, "user")
                             }
                             _ => unreachable!(),
                         };
@@ -534,10 +535,11 @@ impl Desk {
                                 .map_err(|_| StoreError::Invalid("enter a numeric task ID"))?;
                             let item = self.store.show(target)?;
                             self.store
-                                .attach(id, project.revision, item.id, item.revision)
+                                .attach(id, project.revision, item.id, item.revision, "user")
                         } else {
                             let (title, body) = draft.split_once('\n').unwrap_or((draft, ""));
-                            self.store.add_step(id, project.revision, title, body)
+                            self.store
+                                .add_step(id, project.revision, title, body, "user")
                         }
                     });
                     let ok = result.is_ok();
@@ -629,7 +631,7 @@ impl Desk {
                 KeyCode::Esc => self.mode = Mode::Desk,
                 KeyCode::Enter if !draft.trim().is_empty() => {
                     let id = item.id;
-                    let result = self.store.send_message(id, item.revision, draft);
+                    let result = self.store.send_message(id, item.revision, draft, "user");
                     if result.is_ok() {
                         self.mode = Mode::Desk;
                         self.result(result);
@@ -685,7 +687,7 @@ impl Desk {
             Mode::Move(item) => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.mode = Mode::Desk,
                 KeyCode::Char('9') => {
-                    let result = self.store.calendar_action(item.id, item.revision);
+                    let result = self.store.calendar_action(item.id, item.revision, "user");
                     self.mode = Mode::Desk;
                     self.result(result);
                 }
@@ -771,6 +773,7 @@ impl Desk {
                                 "https://example.invalid/reviews/1",
                                 "https://example.invalid/reviews/2",
                             ],
+                            "system:watch",
                         );
                         self.result(result);
                     }
@@ -815,7 +818,7 @@ impl Desk {
                         } else {
                             "agent"
                         };
-                        let result = self.store.assign(item.id, item.revision, who);
+                        let result = self.store.assign(item.id, item.revision, who, "user");
                         self.result(result);
                     }
                 }
@@ -1558,7 +1561,8 @@ fn tui(
                     }
                     match new {
                         Ok(body) => {
-                            let result = desk.store.edit_body(item.id, item.revision, &body);
+                            let result =
+                                desk.store.edit_body(item.id, item.revision, &body, "user");
                             if matches!(result, Err(StoreError::Stale { .. }))
                                 && let Ok(latest) = desk.store.show(item.id)
                             {

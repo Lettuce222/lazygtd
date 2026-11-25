@@ -59,6 +59,16 @@ pub fn agent(c: &Connection, id: i64, run: i64, text: &str) -> rusqlite::Result<
     Ok(())
 }
 
+/// An agent's reply written outside a run, e.g. through the CLI. It is unread
+/// so the task shows up for the user.
+pub fn reply(c: &Connection, id: i64, text: &str) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT INTO task_message(item_id,role,body,read) VALUES(?,'agent',?,0)",
+        params![id, text],
+    )?;
+    Ok(())
+}
+
 pub fn claim(c: &Connection, id: i64, run: i64) -> rusqlite::Result<()> {
     c.execute(
         "UPDATE task_message SET run_id=? WHERE item_id=? AND role='user' AND run_id IS NULL",
