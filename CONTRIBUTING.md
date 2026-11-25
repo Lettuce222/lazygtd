@@ -13,6 +13,7 @@ task data, agent settings, credentials, built executables, or local DB files.
 Include reproduction steps and the platform when reporting a bug. See
 [SECURITY.md](SECURITY.md) for vulnerability reports.
 
-Release tags must match the Cargo version prefixed with v. GitHub Actions tests
-and builds the supported operating-system and CPU matrix, packages notices,
-generates SHA256SUMS and signed provenance, then publishes the Release.
+To release, bump the Cargo package version in both `Cargo.toml` and `Cargo.lock`
+and merge into `main`. GitHub Actions tests and builds the supported platforms,
+packages notices, generates SHA256SUMS and signed provenance, and then tags
+the tested commit and publishes. Existing or older versions do not publish.

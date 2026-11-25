@@ -81,10 +81,13 @@ cargo build --release --locked
 ```
 
 The build compiles the bundled C SQLite sources with the developer/CI
-toolchain; this is not a user-side dependency. The tag-triggered Release
-workflow tests and builds only this repo. A maintainer tags a reviewed
-commit with its Cargo version (e.g. `v0.1.0-preview.5`); the workflow
-publishes a prerelease after the full platform matrix passes. It includes
+toolchain; this is not a user-side dependency. To release, bump the version
+in `Cargo.toml` and `Cargo.lock` and merge into `main`. The workflow publishes
+only when that version exceeds every published release, and only after lint
+and the full platform matrix pass. It creates the version tag at the tested
+commit; a `-preview.N` version is published as a prerelease. Same-version
+changes and pull requests run CI without publishing. Use **Run workflow** on
+`main` to retry an unpublished version. The release includes
 SHA256SUMS, bundled notices and GitHub build provenance, not OS signatures. When the native Apple Silicon runner is unavailable, the ARM Mac binary is cross-compiled and architecture-checked on Intel macOS, not runtime-tested on Apple Silicon. The previous Go implementation is [in dotfiles history](https://github.com/Lettuce222/dotfiles/tree/322bea95fea96e491cc1c742e32a92c231c5b61f/tools/lazygtd).
 
 ### Agent handoff (preview)
