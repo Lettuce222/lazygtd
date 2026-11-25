@@ -615,3 +615,149 @@ fn list_filters_and_show_with_steps_and_conversation() {
     let odd = json(t.run(&db(&["add", "--", "--json"])));
     assert_eq!(odd["title"], "--json");
 }
+
+#[cfg(unix)]
+#[test]
+fn trusted_launch_uses_normal_settings_rules_file_and_is_announced() {
+    use serde_json::json;
+    use std::{fs, os::unix::fs::PermissionsExt};
+    let t = Temp::new();
+    let root = t.0.canonicalize().unwrap();
+    let workspace = root.join("ws");
+    fs::create_dir(&workspace).unwrap();
+    let record = root.join("args.txt");
+    let exe = root.join("claude");
+    fs::write(
+        &exe,
+        format!(
+            "#!/bin/sh\ncat >/dev/null\n: > {rec}\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> {rec}; done\nprintf 'mark=%s\\n' \"${{LAZYGTD_FIXTURE_MARK:-}}\" >> {rec}\nprintf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"synthetic report\",\"permission_denials\":[]}}'\n",
+            rec = record.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&exe, fs::Permissions::from_mode(0o700)).unwrap();
+    let rules = root.join("rules.md");
+    fs::write(&rules, "- synthetic rule\n").unwrap();
+    fs::set_permissions(&rules, fs::Permissions::from_mode(0o600)).unwrap();
+    let db = root.join("agent.db");
+    let config = root.join("agent.json");
+    let lazygtd = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_lazygtd"))
+            .env_clear()
+            .env("HOME", &root)
+            .env("LAZYGTD_FIXTURE_MARK", "inherited")
+            .arg("--db")
+            .arg(&db)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let write_config = |value: Value| fs::write(&config, value.to_string()).unwrap();
+    let config_arg = config.to_str().unwrap();
+    let base = json!({"provider":"claude","executable":exe,"workspace":workspace});
+    let run = |rev: i64| -> Vec<String> {
+        let item = json(lazygtd(&["add", "Synthetic task", "--assignee", "agent"]));
+        let id = item["id"].to_string();
+        json(lazygtd(&[
+            "instruct",
+            &id,
+            &rev.to_string(),
+            "synthetic directions",
+        ]));
+        json(lazygtd(&[
+            "agent-run",
+            &id,
+            &(rev + 1).to_string(),
+            config_arg,
+            "--send",
+        ]));
+        fs::read_to_string(&record)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    };
+
+    write_config(base.clone());
+    let readonly = run(1);
+    assert!(readonly.iter().any(|a| a == "--safe-mode"));
+    assert!(readonly.iter().any(|a| a == "--setting-sources"));
+    assert!(readonly.iter().any(|a| a == "mark="));
+    let item = json(lazygtd(&["list", "--json"]))[0]["id"].to_string();
+    let preview = json(lazygtd(&["agent-preview", &item, config_arg]));
+    assert_eq!(preview["mode"], "read-only");
+    assert!(preview["trusted_warning"].is_null());
+
+    let mut trusted = base.clone();
+    trusted["mode"] = json!("trusted");
+    trusted["permission_mode"] = json!("acceptEdits");
+    trusted["rules_file"] = json!(rules);
+    trusted["inherit_env"] = json!(true);
+    write_config(trusted.clone());
+    let preview = json(lazygtd(&["agent-preview", &item, config_arg]));
+    assert_eq!(preview["mode"], "trusted");
+    assert_eq!(preview["permission_mode"], "acceptEdits");
+    assert_eq!(preview["rules_file"], json!(rules));
+    assert_eq!(preview["inherit_env"], true);
+    assert!(
+        preview["trusted_warning"]
+            .as_str()
+            .unwrap()
+            .contains("hooks")
+    );
+    let args = run(1);
+    for restricted in [
+        "--safe-mode",
+        "--setting-sources",
+        "--tools",
+        "--strict-mcp-config",
+        "--disallowedTools",
+    ] {
+        assert!(
+            !args.iter().any(|a| a == restricted),
+            "{restricted}: {args:?}"
+        );
+    }
+    assert!(
+        args.windows(2)
+            .any(|w| w[0] == "--permission-mode" && w[1] == "acceptEdits")
+    );
+    assert!(
+        args.windows(2)
+            .any(|w| w[0] == "--append-system-prompt-file" && w[1] == rules.to_str().unwrap())
+    );
+    assert!(args.iter().any(|a| a == "mark=inherited"));
+
+    // Without inherit_env the environment is still narrowed.
+    trusted["inherit_env"] = json!(false);
+    write_config(trusted.clone());
+    assert!(run(1).iter().any(|a| a == "mark="));
+
+    let rejected = |value: Value, message: &str| {
+        write_config(value);
+        fails(lazygtd(&["agent-preview", &item, config_arg]), message);
+    };
+    fs::set_permissions(&rules, fs::Permissions::from_mode(0o620)).unwrap();
+    rejected(trusted.clone(), "rules_file must be owned by you");
+    fs::set_permissions(&rules, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut relative = trusted.clone();
+    relative["rules_file"] = json!("rules.md");
+    rejected(relative, "rules_file must be an absolute");
+    let mut bypass = trusted.clone();
+    bypass["permission_mode"] = json!("bypassPermissions");
+    rejected(bypass, "permission_mode for claude must be one of");
+    let mut readonly_rules = base.clone();
+    readonly_rules["rules_file"] = json!(rules);
+    rejected(readonly_rules, "require mode: trusted");
+    let mut codex_rules = trusted.clone();
+    codex_rules["provider"] = json!("codex");
+    codex_rules["permission_mode"] = json!("workspace-write");
+    rejected(codex_rules, "rules_file is supported for claude only");
+
+    write_config(trusted);
+    fails(
+        t.run(&["--demo", "--agent-config", config_arg]),
+        "not available in demo",
+    );
+    fails(t.run(&["--demo", "agent-preview", "1", config_arg]), "");
+}
