@@ -70,7 +70,9 @@ lazygtd done 1 2
 Mutations require the item's current revision except for add. A stale
 revision fails with exit code 3. Reload with `show` or `list` before
 deciding whether to retry. The item change and its event history are
-committed together. There is no account, synchronization, legacy data import,
+committed together. Agents can create, read, edit, archive and reply
+through the same CLI with JSON output; see the
+[agent CLI guide](docs/agent-cli.md). There is no account, synchronization, legacy data import,
 encryption, or Linear integration in this preview.
 
 ## Maintain or stage a release
@@ -128,7 +130,7 @@ There is no automatic launch or credential registration.
 
 The worker cannot mark a GTD task complete via its response. The app reserves
 at most one active run per task; the exit status and provider protocol
-determine the result. A report or failure makes the task visible in Next Actions under your responsibility. Fresh setup and existing v1–v5 databases use the same v6
+determine the result. A report or failure makes the task visible in Next Actions under your responsibility. Fresh setup and existing v1–v6 databases use the same v7
 schema; older binaries cannot open a migrated database. See [storage design and spec progress](docs/spec-progress.md).
 
 These adapters are for read-only research/planning in a trusted workspace;
