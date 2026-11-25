@@ -1,16 +1,21 @@
 mod agent;
+mod approval_server;
+mod claude_review;
 mod cli;
 mod db_file;
 mod local_files;
 mod planning;
+mod pr_watch;
 mod questions;
 mod render;
+mod review_agent;
+mod sessions;
 mod store;
 mod talk;
 
 #[cfg(test)]
 use store::Sqlite;
-use store::{BOX_IDS, Item, Store, StoreError};
+use store::{Item, Store, StoreError};
 
 use std::{
     collections::BTreeMap,
@@ -32,13 +37,11 @@ use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::Text,
+    text::{Line, Text},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
 
-const BOXES: [&str; 8] = [
-    "あなたの番",
-    "窓口",
+const BOXES: [&str; 6] = [
     "Inbox",
     "次の行動",
     "プロジェクト",
@@ -46,6 +49,27 @@ const BOXES: [&str; 8] = [
     "いつか",
     "資料",
 ];
+const DISPLAY_BOX_IDS: [&str; BOXES.len()] = [
+    "inbox",
+    "next",
+    "projects",
+    "waiting",
+    "someday",
+    "reference",
+];
+const INBOX: usize = 0;
+const NEXT: usize = 1;
+
+fn display_box(id: &str) -> usize {
+    if matches!(id, "review" | "desk") {
+        return NEXT;
+    }
+    DISPLAY_BOX_IDS
+        .iter()
+        .position(|box_id| *box_id == id)
+        .unwrap_or(INBOX)
+}
+
 const BG: Color = Color::Rgb(36, 40, 59);
 const TEXT: Color = Color::Rgb(192, 202, 245);
 const BLUE: Color = Color::Rgb(122, 162, 247);
@@ -71,6 +95,7 @@ enum Mode {
     Steps(i64, usize),
     StepInput(i64, usize, bool, String),
     Question(i64),
+    LiveReview,
     QuestionText(i64, bool, String),
     SendConfirm(Item, String),
     Artifacts,
@@ -93,6 +118,11 @@ struct Desk {
     questions: Vec<questions::Question>,
     profile_path: Option<PathBuf>,
     agent_config: Option<agent::Config>,
+    pr_watcher: Option<pr_watch::Watcher>,
+    review_settings: Option<review_agent::Settings>,
+    live_review: Option<review_agent::Notice>,
+    review_rx: Option<mpsc::Receiver<review_agent::Notice>>,
+    note_visible: bool,
     outgoing: Option<mpsc::Receiver<String>>,
     can_confirm: bool,
     edit_request: Option<Item>,
@@ -125,6 +155,11 @@ impl Desk {
             questions: Vec::new(),
             profile_path: None,
             agent_config: None,
+            pr_watcher: None,
+            review_settings: None,
+            live_review: None,
+            review_rx: None,
+            note_visible: false,
             outgoing: None,
             can_confirm: false,
             edit_request: None,
@@ -145,37 +180,39 @@ impl Desk {
         let selected = self.picked().map(|item| item.id);
         let query = self.query.to_lowercase();
         let mut entries: [Vec<Item>; BOXES.len()] = std::array::from_fn(|_| Vec::new());
-        let mut handback_next = Vec::new();
+        let waiting_approval = self.live_review.as_ref().map(|notice| notice.item_id);
         for item in self.store.list()?.into_iter().filter(|item| !item.done) {
-            let Some(box_id) = BOX_IDS.iter().position(|id| *id == item.box_id) else {
-                continue;
-            };
-            let matches = query.is_empty()
+            let box_id = display_box(&item.box_id);
+            let matches = waiting_approval == Some(item.id)
+                || query.is_empty()
                 || item.title.to_lowercase().contains(&query)
                 || item.body.to_lowercase().contains(&query);
-            let in_desk = item.pending_message
-                || item.agent_active
+            let needs_me = item.box_id == "review"
+                || item.agent_review
                 || item.unread_reply
-                || (self.selected_box == 1 && selected == Some(item.id));
-            if box_id != 1 && in_desk && (self.selected_box != 1 || matches) {
-                entries[1].push(item.clone());
-            }
-            let is_review = item.agent_review
+                || waiting_approval == Some(item.id)
                 || !planning::review_reasons(&item.planning, &item.box_id, &self.today).is_empty();
-            if box_id != 0 && is_review && (self.selected_box != 0 || matches) {
-                entries[0].push(item.clone());
-            }
-            if item.agent_review && box_id == 0 && (self.selected_box != 3 || matches) {
-                handback_next.push(item.clone());
+            // A Next Actions projection must not change the persisted assignee or
+            // remove the original project/waiting entry.
+            if box_id != NEXT && needs_me && (self.selected_box != NEXT || matches) {
+                let mut own = item.clone();
+                own.assignee = "me".into();
+                entries[NEXT].push(own);
             }
             if item.project_id.is_some() && item.box_id == "someday" {
                 continue;
             }
             if box_id != self.selected_box || matches {
+                let mut item = item;
+                if box_id == NEXT && needs_me {
+                    item.assignee = "me".into();
+                }
                 entries[box_id].push(item);
             }
         }
-        entries[3].extend(handback_next);
+        if let Some(id) = waiting_approval {
+            entries[NEXT].sort_by_key(|item| item.id != id);
+        }
         self.entries = entries;
         let rows = &self.entries[self.selected_box];
         self.selected_row = rows
@@ -197,10 +234,11 @@ impl Desk {
                     format!("Saved #{} but refresh failed: {e}", item.id)
                 } else {
                     if !item.done {
-                        self.selected_box = BOX_IDS
-                            .iter()
-                            .position(|id| *id == item.box_id)
-                            .unwrap_or(2);
+                        self.selected_box = if item.agent_review {
+                            NEXT
+                        } else {
+                            display_box(&item.box_id)
+                        };
                         self.selected_row = self.entries[self.selected_box]
                             .iter()
                             .position(|x| x.id == item.id)
@@ -310,6 +348,29 @@ impl Desk {
             return false;
         }
         match &mut self.mode {
+            Mode::LiveReview => {
+                use approval_server::ReviewDecision::*;
+                let value = match key.code {
+                    KeyCode::Char('y') if self.note_visible => Some(AllowNote),
+                    KeyCode::Char('n') | KeyCode::Esc => Some(Deny),
+                    KeyCode::Char('c') => Some(CancelTurn),
+                    _ => None,
+                };
+                if let Some(value) = value {
+                    let sent = self
+                        .live_review
+                        .take()
+                        .is_some_and(|notice| notice.decide(value));
+                    self.status = if sent {
+                        "今回の要求への判断を送信します".into()
+                    } else {
+                        "要求は失効しました".into()
+                    };
+                    self.note_visible = false;
+                    self.mode = Mode::Desk;
+                    let _ = self.reload();
+                }
+            }
             Mode::Artifacts => {
                 if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                     self.mode = Mode::Desk;
@@ -628,11 +689,11 @@ impl Desk {
                     self.mode = Mode::Desk;
                     self.result(result);
                 }
-                KeyCode::Char(c @ '1'..='8') => {
+                KeyCode::Char(c @ '1'..='6') => {
                     let result = self.store.move_to(
                         item.id,
                         item.revision,
-                        BOX_IDS[(c as u8 - b'1') as usize],
+                        DISPLAY_BOX_IDS[(c as u8 - b'1') as usize],
                         "user",
                     );
                     self.mode = Mode::Desk;
@@ -649,7 +710,17 @@ impl Desk {
                 KeyCode::Char('c') => self.mode = Mode::Add(String::new()),
                 KeyCode::Enter => {
                     if let Some(item) = self.picked() {
-                        self.mode = Mode::Compose(item.clone(), String::new());
+                        if self.selected_box == NEXT
+                            && self
+                                .live_review
+                                .as_ref()
+                                .is_some_and(|notice| notice.item_id == item.id)
+                        {
+                            self.note_visible = false;
+                            self.mode = Mode::LiveReview;
+                        } else {
+                            self.mode = Mode::Compose(item.clone(), String::new());
+                        }
                     }
                 }
                 KeyCode::Char('s') if !self.demo && self.agent_config.is_some() => {
@@ -668,7 +739,10 @@ impl Desk {
                     }
                 }
                 KeyCode::Char('!') => {
-                    if let Some(q) = self.questions.first() {
+                    if self.live_review.is_some() {
+                        self.note_visible = false;
+                        self.mode = Mode::LiveReview;
+                    } else if let Some(q) = self.questions.first() {
                         self.question_scroll = 0;
                         self.question_end = u16::MAX;
                         self.mode = Mode::Question(q.id);
@@ -793,7 +867,7 @@ impl Desk {
                     }
                     self.detail_scroll = 0;
                 }
-                KeyCode::Char(c @ '1'..='8') => self.select((c as u8 - b'1') as usize),
+                KeyCode::Char(c @ '1'..='6') => self.select((c as u8 - b'1') as usize),
                 _ => {}
             },
         }
@@ -848,14 +922,22 @@ impl Desk {
         };
         let (tx, rx) = mpsc::channel();
         self.outgoing = Some(rx);
+        let settings = self.review_settings.clone();
+        let (review_tx, review_rx) = mpsc::sync_channel(1);
+        self.review_rx = settings.as_ref().map(|_| review_rx);
         self.mode = Mode::Desk;
         self.status = "エージェントを起動しています".into();
         std::thread::spawn(move || {
             let result = store::Sqlite::open(&path)
                 .map_err(|e| e.to_string())
                 .and_then(|mut store| {
-                    agent::run_verified(&mut store, id, rev, &config, Some(&prompt))
-                        .map_err(|e| e.to_string())
+                    match settings {
+                        Some(settings) => review_agent::run(
+                            &mut store, id, rev, &config, &prompt, &settings, review_tx,
+                        ),
+                        None => agent::run_verified(&mut store, id, rev, &config, Some(&prompt)),
+                    }
+                    .map_err(|e| e.to_string())
                 });
             let status = match result {
                 Ok(_) => "エージェントの返事が届きました".into(),
@@ -877,15 +959,53 @@ impl Desk {
     }
 
     fn tick(&mut self, now: Instant) {
+        if self.live_review.as_ref().is_some_and(|n| now >= n.deadline) {
+            self.live_review = None;
+            let _ = self.reload();
+            self.note_visible = false;
+            if self.mode == Mode::LiveReview {
+                self.mode = Mode::Desk;
+            }
+        }
+        if self.live_review.is_none()
+            && let Some(rx) = &self.review_rx
+            && let Ok(notice) = rx.try_recv()
+            && now < notice.deadline
+        {
+            self.live_review = Some(notice);
+            let _ = self.reload();
+        }
+        if let Some(watcher) = &mut self.pr_watcher {
+            match watcher.tick(&mut *self.store, now) {
+                Ok(n) if n > 0 => {
+                    let _ = self.reload();
+                    self.status = format!("すべてのPRが閉じた {n} 件を次の行動へ移しました");
+                }
+                Err(e) => self.status = e.to_string(),
+                _ => {}
+            }
+        }
         if let Some(rx) = &self.outgoing {
             match rx.try_recv() {
                 Ok(message) => {
                     self.outgoing = None;
+                    self.review_rx = None;
+                    self.live_review = None;
+                    self.note_visible = false;
+                    if self.mode == Mode::LiveReview {
+                        self.mode = Mode::Desk;
+                    }
                     self.status = message;
                     let _ = self.reload();
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.outgoing = None;
+                    self.review_rx = None;
+                    self.live_review = None;
+                    self.note_visible = false;
+                    if self.mode == Mode::LiveReview {
+                        self.mode = Mode::Desk;
+                    }
                     self.status = "実行プロセスが終了しました".into();
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -978,21 +1098,31 @@ impl Desk {
             Layout::horizontal([Constraint::Percentage(42), Constraint::Fill(1)]).areas(board);
         let [detail, compose] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(6)]).areas(right);
-        for (i, rect) in sidebar_slots(sidebar).into_iter().enumerate() {
+        for (i, rect) in sidebar_slots(sidebar, self.selected_box)
+            .into_iter()
+            .enumerate()
+        {
             let selected = i == self.selected_box;
+            let total = self.entries[i].len();
+            let position = if selected && total > 0 {
+                self.selected_row.min(total - 1) + 1
+            } else {
+                0
+            };
             let block = Block::default()
                 .borders(Borders::ALL)
                 .style(BASE)
                 .border_style(if selected { FOCUS } else { BASE })
-                .title(format!(
-                    " {} {} ({}) ",
-                    i + 1,
-                    BOXES[i],
-                    self.entries[i].len()
-                ));
+                .title(format!(" {} {} ", i + 1, BOXES[i]))
+                .title_bottom(Line::from(format!(" {position} of {total} ")).right_aligned());
+            if sidebar_collapsed(i, self.selected_box) {
+                f.render_widget(block, rect);
+                continue;
+            }
             let capacity = rect.height.saturating_sub(2) as usize;
+            let question_count = self.questions.len() + usize::from(self.live_review.is_some());
             let show_question_row =
-                i == 0 && !self.questions.is_empty() && capacity > usize::from(selected);
+                i == NEXT && question_count > 0 && capacity > usize::from(selected);
             let capacity = capacity.saturating_sub(usize::from(show_question_row));
             let offset = if selected {
                 self.selected_row.saturating_sub(capacity.saturating_sub(1))
@@ -1006,7 +1136,12 @@ impl Desk {
                 .map(|(row, item)| {
                     ListItem::new(format!(
                         "{}{}{}",
-                        if item.unread_reply {
+                        if i == NEXT
+                            && let Some(review) =
+                                self.live_review.as_ref().filter(|n| n.item_id == item.id)
+                        {
+                            review.badge()
+                        } else if item.unread_reply {
                             "● "
                         } else if item.pending_message {
                             "… "
@@ -1015,6 +1150,8 @@ impl Desk {
                         },
                         if item.assignee == "agent" {
                             "AI · "
+                        } else if i == NEXT {
+                            "自分 · "
                         } else {
                             ""
                         },
@@ -1028,7 +1165,7 @@ impl Desk {
                 });
             let questions = if show_question_row {
                 vec![
-                    ListItem::new(format!("! 問い ({})", self.questions.len()))
+                    ListItem::new(format!("! 問い ({question_count})"))
                         .style(Style::new().fg(Color::Rgb(224, 175, 104))),
                 ]
             } else {
@@ -1087,10 +1224,16 @@ impl Desk {
                     summary.push_str(&format!("\n\n指示: {}", x.instructions));
                 }
                 match self.store.latest_run(x.id) {
-                    Ok(Some(run)) => summary.push_str(&format!(
-                        "\n\n実行 #{} · {} · {} ({})\n{}",
-                        run.id, run.provider, run.state, run.activity, run.result
-                    )),
+                    Ok(Some(run)) => {
+                        summary.push_str(&format!(
+                            "\n\n実行 #{} · {} · {} ({})",
+                            run.id, run.provider, run.state, run.activity
+                        ));
+                        if let Some(native) = &run.session_id {
+                            summary.push_str(&format!("\nセッション: {native}"));
+                        }
+                        summary.push_str(&format!("\n{}", run.result));
+                    }
                     Err(e) => summary.push_str(&format!("\n\n実行状況の取得に失敗: {e}")),
                     Ok(None) => {}
                 }
@@ -1117,7 +1260,11 @@ impl Desk {
         } else {
             "WORK (saved locally)"
         };
-        let question_status = if self.questions.is_empty() {
+        let question_status = if self.live_review.is_some() {
+            self.live_review
+                .as_ref()
+                .map_or(String::new(), |n| format!(" ! {}の承認待ち", n.provider))
+        } else if self.questions.is_empty() {
             String::new()
         } else {
             format!(" ! 問い {}", self.questions.len())
@@ -1171,7 +1318,7 @@ impl Desk {
             _ if !self.query.is_empty() => {
                 format!("Filter: {}   / edit   Esc clear   ? help", self.query)
             }
-            _ => "1-8 box  j/k rows  c add  e body  / filter  ? help  q quit".into(),
+            _ => "1-6 box  j/k rows  c add  e body  / filter  ? help  q quit".into(),
         };
         f.render_widget(
             Paragraph::new(format!(
@@ -1183,7 +1330,7 @@ impl Desk {
         );
         match &self.mode {
             Mode::Desk | Mode::Filter(_) | Mode::Compose(..) => {}
-            Mode::Help => popup(f, area, "Keys", "1-8 or h/l/Tab: box  j/k: row\nc: add  f: move  x: done  r: reload\na: assign  i: instructions  s: simulate (demo only)\ne: body  /: filter  Ctrl+D/U: scroll\np: steps  t: settings  !: questions  Enter: reply\nE: external editor  o: artifacts  w: check demo watch\n?: help   q: close this panel or quit".into(), 10),
+            Mode::Help => popup(f, area, "Keys", "1-6 or h/l/Tab: box  j/k: row\nc: add  f: move  x: done  r: reload\na: assign  i: instructions  s: simulate (demo only)\ne: body  /: filter  Ctrl+D/U: scroll\np: steps  t: settings  !: questions  Enter: reply\nE: external editor  o: artifacts  w: check demo watch\n?: help   q: close this panel or quit".into(), 10),
             Mode::Add(draft) => popup(f, area, "Add Inbox item", editor_text(draft,"Enter: add"), 11),
             Mode::Instruct(_,draft) => popup(f,area,"Agent instructions",editor_text(draft,"Enter: save locally"),11),
             Mode::EditBody(_,draft)=>popup(f,area,"Edit body",editor_text(draft,"Enter: save"),11),
@@ -1212,11 +1359,51 @@ impl Desk {
                     f.render_widget(paragraph.scroll((self.question_scroll,0)),rect);
                 }
             }
-            Mode::Artifacts=>popup(f,area,"成果物（デモ）","report.md\n\n## 試作の確認結果\nタイトルと本文からタスクを作成できました。\n次は、実行結果を「あなたの番」で確認してください。\n\nEsc: 閉じる".into(),10),
+            Mode::Artifacts=>popup(f,area,"成果物（デモ）","report.md\n\n## 試作の確認結果\nタイトルと本文からタスクを作成できました。\n次は、実行結果を「次の行動」で確認してください。\n\nEsc: 閉じる".into(),10),
+            Mode::LiveReview => {
+                self.note_visible = false;
+                if let Some(notice) = &self.live_review {
+                    let remaining = notice.deadline.saturating_duration_since(Instant::now()).as_secs();
+                    let base = format!("{} / 残り {remaining} 秒
+", notice.provider);
+                    let height = area.height.saturating_sub(4).min(32);
+                    let width = area.width.min(64).saturating_sub(2);
+                    let note = self.review_settings.as_ref().and_then(|c| c.note.as_deref());
+                    let detail = notice.detail.as_deref().unwrap_or("");
+                    let mut body = format!("{base}\n要求: {}\n{detail}\nこの画面では実行権限は与えません。\nn / Esc: 拒否　c: 実行を中断", notice.method);
+                    if notice.method == "item/tool/call" && let Some(note) = note {
+                        let destination = self.agent_config.as_ref().map_or_else(String::new, agent::Config::destination);
+                        let candidate = format!("{base}送信先: {destination}
+{}
+
+{}
+
+y: この全文を一度だけ送信
+n / Esc: 拒否　c: 実行を中断", note.path().display(), note.content());
+                        self.note_visible = Paragraph::new(candidate.as_str()).wrap(Wrap { trim:false })
+                            .line_count(width) <= usize::from(height.saturating_sub(2));
+                        body = if self.note_visible { candidate } else {
+                            format!("{base}
+メモ全文が見えないため許可できません。
+端末を広げるか拒否してください。
+n / Esc: 拒否　c: 実行を中断")
+                        };
+                    }
+                    popup(f,area,"エージェントの承認待ち",body,height);
+                }
+            }
             Mode::SendConfirm(_,prompt)=>{
                 let destination=self.agent_config.as_ref().map_or_else(String::new,agent::Config::destination);
-                let scope=if self.agent_config.as_ref().is_some_and(agent::Config::allow_file_reads) {"CLIのファイル読み取り: 有効"}else{"CLIのファイル読み取り: 無効を要求"};
-                let preview=format!("送信先: {destination}\n{scope}\n{}\n\n{prompt}",agent::TRUST_WARNING);
+                let scope=if self.review_settings.as_ref().is_some_and(|s| s.note.is_some()) {
+                    "ファイル読み取り: 無効を要求。指定メモは別の確認が必要"
+                } else if self.agent_config.as_ref().is_some_and(agent::Config::allow_file_reads) {
+                    "CLIのファイル読み取り: 有効"
+                } else {
+                    "CLIのファイル読み取り: 無効を要求"
+                };
+                let history = self.agent_config.as_ref().and_then(agent::Config::history_warning).unwrap_or("");
+                let review = self.review_settings.as_ref().map_or_else(String::new, |s| format!("\n{}（対話確認つき）", s.provider.label()));
+                let preview=format!("送信先: {destination}\n{scope}{review}\n{}{}\n\n{prompt}",agent::TRUST_WARNING, if history.is_empty() { String::new() } else { format!("\n{history}") });
                 let w=area.width.min(64).saturating_sub(2);
                 let height=area.height.saturating_sub(4).min(28);
                 let paragraph=Paragraph::new(preview.as_str()).wrap(Wrap{trim:false});
@@ -1229,7 +1416,7 @@ impl Desk {
                 popup(f,area,"外部送信の確認",message,height);
             }
             Mode::QuestionText(_,_,draft)=>popup(f,area,"問いへの回答",editor_text(draft,"Enter: 記録"),11),
-            Mode::Move(item) => popup(f, area, "Move item", format!("#{}: {}\n1 review  2 desk  3 inbox  4 next\n5 projects  6 waiting  7 someday  8 reference\n9: カレンダーに入れる（次の行動）\nEsc: cancel", item.id, item.title), 8),
+            Mode::Move(item) => popup(f, area, "Move item", format!("#{}: {}\n1 Inbox  2 次の行動  3 プロジェクト\n4 連絡待ち  5 いつか  6 資料\n9: カレンダーに入れる（次の行動）\nEsc: cancel", item.id, item.title), 8),
         }
     }
 }
@@ -1260,10 +1447,27 @@ fn editor_text(draft: &str, action: &str) -> String {
     format!("{preview}\n\n{action}  Ctrl+J / Shift+Enter: newline  Esc: cancel")
 }
 
-fn sidebar_slots(sidebar: Rect) -> [Rect; 8] {
+fn sidebar_collapsed(index: usize, selected: usize) -> bool {
+    matches!(DISPLAY_BOX_IDS[index], "someday" | "reference") && index != selected
+}
+
+fn sidebar_slots(sidebar: Rect, selected: usize) -> [Rect; BOXES.len()] {
+    let collapsed = (0..BOXES.len())
+        .filter(|&i| sidebar_collapsed(i, selected))
+        .count() as u16;
+    let header_height = 2.min(sidebar.height / BOXES.len() as u16);
+    let open = BOXES.len() as u16 - collapsed;
+    let height_for_open = sidebar.height - collapsed * header_height;
     let mut y = sidebar.y;
+    let mut slot = 0;
     std::array::from_fn(|i| {
-        let height = sidebar.height / 8 + u16::from((i as u16) < sidebar.height % 8);
+        let height = if sidebar_collapsed(i, selected) {
+            header_height
+        } else {
+            let extra = u16::from(slot < height_for_open % open);
+            slot += 1;
+            height_for_open / open + extra
+        };
         let rect = Rect::new(sidebar.x, y, sidebar.width, height);
         y += height;
         rect
@@ -1292,10 +1496,14 @@ fn tui(
     demo: bool,
     path: Option<PathBuf>,
     config: Option<agent::Config>,
+    pr_watcher: Option<pr_watch::Watcher>,
+    review_settings: Option<review_agent::Settings>,
 ) -> io::Result<()> {
     let mut desk = Desk::new(store, demo).map_err(io::Error::other)?;
     desk.profile_path = path;
     desk.agent_config = config;
+    desk.pr_watcher = pr_watcher;
+    desk.review_settings = review_settings;
     let mut terminal = ratatui::try_init()?;
     let bracketed = execute!(io::stdout(), EnableBracketedPaste).is_ok();
     let result = (|| {
@@ -1326,6 +1534,10 @@ fn tui(
                 let large_enough = terminal
                     .size()
                     .is_ok_and(|s| s.width >= MIN_WIDTH && s.height >= MIN_HEIGHT);
+                if !large_enough {
+                    desk.can_confirm = false;
+                    desk.note_visible = false;
+                }
                 // Do not accidentally send or edit a hidden draft on a tiny terminal.
                 let quit =
                     key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
@@ -1402,8 +1614,11 @@ mod tests {
     fn compose_is_per_task_and_simulated_send_builds_a_thread() {
         let mut desk = Desk::demo();
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        press(&mut desk, '4');
-        press(&mut desk, 'j');
+        press(&mut desk, '2');
+        desk.selected_row = desk.entries[NEXT]
+            .iter()
+            .position(|item| item.box_id == "next" && item.assignee == "agent")
+            .unwrap();
         let id = desk.picked().unwrap().id;
         desk.key(enter);
         assert!(matches!(desk.mode, Mode::Compose(..)));
@@ -1413,8 +1628,14 @@ mod tests {
         desk.key(enter);
         assert!(desk.store.show(id).unwrap().pending_message);
         assert_eq!(desk.store.conversation(id).unwrap().len(), 1);
-        assert_eq!(desk.entries[1].iter().filter(|row| row.id == id).count(), 1);
+        assert!(desk.entries[NEXT].iter().any(|row| row.id == id));
         desk.tick(Instant::now() + Duration::from_secs(2));
+        let row = desk.entries[NEXT]
+            .iter()
+            .position(|row| row.id == id)
+            .unwrap();
+        desk.select(NEXT);
+        desk.selected_row = row;
         let item = desk.picked().unwrap();
         assert_eq!(item.id, id);
         assert_eq!(item.box_id, "review");
@@ -1465,16 +1686,19 @@ mod tests {
         desk.key(enter(KeyModifiers::SHIFT));
         assert!(matches!(desk.mode, Mode::Filter(_)));
         desk.key(enter(KeyModifiers::NONE));
-        assert_eq!(desk.entries[2].len(), 1);
+        assert_eq!(desk.entries[INBOX].len(), 1);
         press(&mut desk, 'l');
-        assert_eq!(desk.entries[2].len(), 3);
+        assert_eq!(desk.entries[INBOX].len(), 3);
     }
 
     #[test]
     fn demo_agent_returns_to_human_review_without_finishing() {
         let mut desk = Desk::demo();
-        press(&mut desk, '4');
-        press(&mut desk, 'j');
+        press(&mut desk, '2');
+        desk.selected_row = desk.entries[NEXT]
+            .iter()
+            .position(|item| item.box_id == "next" && item.assignee == "agent")
+            .unwrap();
         let id = desk.picked().unwrap().id;
         assert_eq!(desk.picked().unwrap().assignee, "agent");
         press(&mut desk, 's');
@@ -1491,7 +1715,7 @@ mod tests {
     }
 
     #[test]
-    fn rendered_boxes_do_not_move_when_switching_or_finishing_items() {
+    fn expanded_reference_does_not_resize_when_finishing_items() {
         let mut desk = Desk::demo();
         let titles = |frame: &[String]| {
             BOXES.map(|title| {
@@ -1509,17 +1733,21 @@ mod tests {
         };
         let before = view(&mut desk, 100, 31);
         let expected = titles(&before);
-        assert_eq!(expected, [0, 4, 8, 12, 16, 20, 23, 26]);
-        press(&mut desk, '3');
+        assert_eq!(expected, [0, 7, 13, 19, 25, 27]);
+        press(&mut desk, '1');
         assert_eq!(titles(&view(&mut desk, 100, 31)), expected);
-        press(&mut desk, 'j');
+        desk.selected_row = desk.entries[INBOX]
+            .iter()
+            .position(|item| item.title == "明日の会議を準備する")
+            .unwrap();
         assert!(view(&mut desk, 100, 31).iter().any(|line| {
             line.replace(char::is_whitespace, "")
                 .contains("明日の会議を準備する")
         }));
-        press(&mut desk, '8');
+        press(&mut desk, '6');
         let after = view(&mut desk, 100, 31);
-        assert_eq!(titles(&after), expected);
+        let expanded = titles(&after);
+        assert_eq!(expanded, [0, 6, 12, 17, 22, 24]);
         assert!(after.iter().any(|line| {
             line.replace(char::is_whitespace, "")
                 .contains("キーバインドの早見表")
@@ -1527,8 +1755,102 @@ mod tests {
         press(&mut desk, 'x');
         press(&mut desk, 'x');
         let empty = view(&mut desk, 100, 31);
-        assert_eq!(titles(&empty), expected);
+        assert_eq!(titles(&empty), expanded);
         assert!(empty.iter().any(|line| line.contains("(empty box)")));
+    }
+
+    #[test]
+    fn low_priority_boxes_collapse_and_counters_track_focus_filter_and_empty_lists() {
+        let mut desk = Desk::demo();
+        let someday = 4;
+        let reference = 5;
+
+        let read = |desk: &mut Desk, i: usize| {
+            let frame = view(desk, 100, 40);
+            let rect = sidebar_slots(Rect::new(0, 0, 42, 38), desk.selected_box)[i];
+            let line = |y| frame[y as usize].chars().take(42).collect::<String>();
+            // The counter must be flush right on the bottom border.
+            assert!(line(rect.bottom() - 1).ends_with(" ┘"));
+            let bottom = line(rect.bottom() - 1);
+            (
+                rect.height,
+                bottom,
+                (rect.y + 1..rect.bottom() - 1)
+                    .map(line)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        for i in [someday, reference] {
+            let (height, bottom, rows) = read(&mut desk, i);
+            assert_eq!(height, 2);
+            assert!(rows.is_empty());
+            assert!(bottom.ends_with(&format!(" 0 of {} ┘", desk.entries[i].len())));
+        }
+        press(&mut desk, '6');
+        let (h, footer, rows) = read(&mut desk, reference);
+        assert!(h > 2);
+        assert!(footer.ends_with(" 1 of 2 ┘"));
+        assert!(
+            rows.join("\n")
+                .replace(char::is_whitespace, "")
+                .contains("キーバインドの早見表")
+        );
+        press(&mut desk, 'j');
+        assert!(read(&mut desk, reference).1.ends_with(" 2 of 2 ┘"));
+        desk.query = "does-not-match-the-demo".into();
+        desk.reload().unwrap();
+        assert!(read(&mut desk, reference).1.ends_with(" 0 of 0 ┘"));
+        press(&mut desk, '5');
+        assert!(read(&mut desk, someday).0 > 2);
+        assert_eq!(read(&mut desk, reference).0, 2);
+    }
+
+    #[test]
+    fn next_actions_keep_legacy_rows_and_overlays_a_claude_approval_only_once() {
+        let mut desk = Desk::demo();
+        let legacy = desk.entries[NEXT]
+            .iter()
+            .filter(|it| matches!(it.box_id.as_str(), "review" | "desk"))
+            .count();
+        assert!(legacy > 0);
+        let task = desk.entries[1]
+            .iter()
+            .find(|it| it.assignee == "agent")
+            .unwrap()
+            .clone();
+        let (notice, rx) = review_agent::Notice::test_claude(task.id);
+        desk.live_review = Some(notice);
+        desk.reload().unwrap();
+        assert_eq!(desk.entries[NEXT][0].id, task.id);
+        assert_eq!(desk.entries[NEXT][0].assignee, "me");
+        assert!(!desk.entries[INBOX].iter().any(|it| it.id == task.id));
+        assert_eq!(
+            desk.entries[NEXT]
+                .iter()
+                .filter(|it| it.id == task.id)
+                .count(),
+            1
+        );
+        assert_eq!(desk.store.show(task.id).unwrap().assignee, "agent");
+        assert!(view(&mut desk, 100, 36).join("\n").contains("Claude"));
+        desk.select(NEXT);
+        desk.selected_row = 0;
+        desk.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(desk.mode, Mode::LiveReview);
+        press(&mut desk, 'n');
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            approval_server::ReviewDecision::Deny
+        );
+        assert!(desk.live_review.is_none());
+        assert_eq!(
+            desk.entries[NEXT]
+                .iter()
+                .find(|it| it.id == task.id)
+                .unwrap()
+                .assignee,
+            "agent"
+        );
     }
 
     #[test]
@@ -1553,9 +1875,13 @@ mod tests {
                 .any(|line| line.contains("quote"))
         );
         assert!(!desk.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
-        assert_eq!(desk.selected_box, 2);
-        assert_eq!(desk.entries[2].last().unwrap().title, "quote");
+        assert_eq!(desk.selected_box, INBOX);
+        assert!(desk.entries[INBOX].iter().any(|item| item.title == "quote"));
         assert!(press(&mut desk, 'q'));
-        assert_eq!(Desk::demo().entries[2].len(), 2);
+        assert!(
+            !Desk::demo().entries[INBOX]
+                .iter()
+                .any(|item| item.title == "quote")
+        );
     }
 }

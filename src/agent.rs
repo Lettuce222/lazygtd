@@ -1,4 +1,7 @@
-use crate::store::{Item, Store};
+use crate::{
+    sessions,
+    store::{Item, Store},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -30,7 +33,15 @@ impl Provider {
         }
     }
 
-    fn command(self, executable: &Path, model: Option<&str>, allow_file_reads: bool) -> Command {
+    fn command(
+        self,
+        executable: &Path,
+        model: Option<&str>,
+        allow_file_reads: bool,
+        workspace: &Path,
+        session_mode: SessionMode,
+        resume: Option<&str>,
+    ) -> Command {
         let mut cmd = Command::new(executable);
         match self {
             Self::Codex => cmd.args([
@@ -38,7 +49,6 @@ impl Provider {
                 "never",
                 "exec",
                 "--json",
-                "--ephemeral",
                 "--ignore-user-config",
                 "--disable",
                 "hooks",
@@ -93,7 +103,6 @@ impl Provider {
                 "{\"mcpServers\":{}}",
                 "--disallowedTools",
                 "mcp__*",
-                "--no-session-persistence",
             ]),
         };
         if matches!(self, Self::Codex) && !allow_file_reads {
@@ -108,7 +117,22 @@ impl Provider {
             cmd.args(["--model", model]);
         }
         if matches!(self, Self::Codex) {
+            // The resume command otherwise inherits the previous workspace.
+            cmd.arg("-C").arg(workspace);
+            if session_mode == SessionMode::Ephemeral {
+                cmd.arg("--ephemeral");
+            }
+            if let Some(id) = resume {
+                cmd.args(["resume", id]);
+            }
             cmd.arg("-");
+        } else {
+            if session_mode == SessionMode::Ephemeral {
+                cmd.arg("--no-session-persistence");
+            }
+            if let Some(id) = resume {
+                cmd.args(["--resume", id]);
+            }
         }
         cmd
     }
@@ -121,6 +145,14 @@ impl Provider {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum SessionMode {
+    #[default]
+    Ephemeral,
+    Persist,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
@@ -130,6 +162,9 @@ struct ConfigFile {
     model: Option<String>,
     #[serde(default)]
     allow_file_reads: bool,
+    #[serde(default)]
+    session_mode: SessionMode,
+    resume_session: Option<String>,
 }
 
 #[derive(Clone)]
@@ -140,8 +175,11 @@ pub struct Config {
     workspace: PathBuf,
     model: Option<String>,
     allow_file_reads: bool,
+    session_mode: SessionMode,
+    resume_session: Option<String>,
 }
 
+const SESSION_WARNING: &str = "保存型: CLIの既定プロフィールに履歴を保存します。再開時は、今回の入力以外に以前の会話やツール出力も送信対象になり得ます。";
 pub const TRUST_WARNING: &str = "実験機能: 公式CLIと信頼できる環境のみ。CLIや管理設定はプレビューにない情報を読み取り、送信できる場合があります。";
 
 fn display_safe(path: &Path) -> bool {
@@ -245,16 +283,41 @@ fn controlled_env(
 impl Config {
     pub fn destination(&self) -> String {
         format!(
-            "{} / {} / {} / {}",
+            "{} / {} / {} / {}{}",
             self.provider.name(),
             self.model.as_deref().unwrap_or("default model"),
             self.workspace.display(),
             self.executable.display(),
+            self.resume_session
+                .as_ref()
+                .map(|id| format!(" / resume {id}"))
+                .unwrap_or_else(|| if self.session_mode == SessionMode::Persist {
+                    " / new persistent session".into()
+                } else {
+                    String::new()
+                }),
         )
     }
 
     pub fn allow_file_reads(&self) -> bool {
         self.allow_file_reads
+    }
+
+    pub fn history_warning(&self) -> Option<&'static str> {
+        (self.session_mode == SessionMode::Persist).then_some(SESSION_WARNING)
+    }
+
+    fn session_request(&self) -> Result<Option<sessions::Request<'_>>> {
+        if self.session_mode == SessionMode::Ephemeral {
+            return Ok(None);
+        }
+        Ok(Some(sessions::Request {
+            workspace: self
+                .workspace
+                .to_str()
+                .ok_or("native session workspace must be valid Unicode")?,
+            expected: self.resume_session.as_deref(),
+        }))
     }
 
     pub fn load(path: &Path) -> Result<Self> {
@@ -264,6 +327,14 @@ impl Config {
             return Err("agent config exceeds 16 KiB".into());
         }
         let config: ConfigFile = serde_json::from_slice(&bytes)?;
+        if let Some(id) = &config.resume_session {
+            if config.session_mode != SessionMode::Persist {
+                return Err("resume_session requires session_mode: persist".into());
+            }
+            if !sessions::valid_id(id) {
+                return Err("resume_session must be a canonical lowercase UUID".into());
+            }
+        }
         if !local_launch_path(&config.workspace) || !config.workspace.is_dir() {
             return Err("agent workspace must be an existing absolute local directory".into());
         }
@@ -293,7 +364,10 @@ impl Config {
             workspace,
             model: config.model,
             allow_file_reads: config.allow_file_reads,
+            session_mode: config.session_mode,
+            resume_session: config.resume_session,
         };
+        config.session_request()?;
         config.verify_launch_paths()?;
         Ok(config)
     }
@@ -356,15 +430,58 @@ impl Config {
         Ok(())
     }
 
+    pub(crate) fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+
+    pub(crate) fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    pub(crate) fn review_command(&self, selected: &str) -> Result<Command> {
+        if self.provider.name() != selected {
+            return Err("review option must match the configured provider".into());
+        }
+        if self.session_mode != SessionMode::Ephemeral || self.allow_file_reads {
+            return Err(
+                "live review requires an ephemeral configuration with file tools disabled".into(),
+            );
+        }
+        self.verify_launch_paths()?;
+        let mut cmd = Command::new(&self.executable);
+        cmd.env_clear()
+            .envs(controlled_env(self.provider, |name| env::var_os(name)))
+            .current_dir(&self.workspace);
+        let key = self.provider.credential_name();
+        if !cmd
+            .get_envs()
+            .any(|(name, value)| name == key && value.is_some_and(|value| !value.is_empty()))
+        {
+            return Err(format!("live review requires {key} in the launch environment").into());
+        }
+        Ok(cmd)
+    }
+
     fn command(&self) -> Result<Command> {
         self.verify_launch_paths()?;
         let mut cmd = self.provider.command(
             &self.executable,
             self.model.as_deref(),
             self.allow_file_reads,
+            &self.workspace,
+            self.session_mode,
+            self.resume_session.as_deref(),
         );
+        // A persisted conversation uses the native CLI’s existing profile,
+        // not a possibly unrelated API key inherited from the calling shell.
+        // No custom profile directory is inherited in either mode.
         cmd.env_clear()
-            .envs(controlled_env(self.provider, |name| env::var_os(name)))
+            .envs(controlled_env(self.provider, |name| {
+                (self.session_mode == SessionMode::Ephemeral
+                    || name != self.provider.credential_name())
+                .then(|| env::var_os(name))
+                .flatten()
+            }))
             .current_dir(&self.workspace);
         Ok(cmd)
     }
@@ -372,13 +489,18 @@ impl Config {
 
 pub fn preview(store: &dyn Store, id: i64, config: &Config) -> Result<()> {
     let item = store.show(id)?;
+    if let Some(scope) = config.session_request()? {
+        store.check_session(id, config.provider.name(), scope)?;
+    }
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "provider": config.provider, "workspace": config.workspace, "model": config.model,
             "id": id, "revision": item.revision, "assignee": item.assignee, "prompt": store.agent_prompt(id)?,
             "executable": config.executable, "allow_file_reads": config.allow_file_reads(),
-            "mode": "read-only", "warning": TRUST_WARNING
+            "mode": "read-only", "warning": TRUST_WARNING,
+            "session_mode": config.session_mode, "resume_session": config.resume_session,
+            "history_warning": config.history_warning()
         }))?
     );
     Ok(())
@@ -413,8 +535,12 @@ pub fn run_verified(
     {
         return Err("outbound prompt changed; preview again".into());
     }
+    let scope = config.session_request()?;
+    if let Some(scope) = scope {
+        store.check_session(id, config.provider.name(), scope)?;
+    }
     let mut cmd = config.command()?;
-    let run = store.start_run(id, rev, config.provider.name())?;
+    let run = store.start_run_scoped(id, rev, config.provider.name(), scope)?;
     let result = (|| {
         let input = store.run_input(run).map_err(io::Error::other)?;
         if expected.is_some_and(|approved| approved != input) {
@@ -422,12 +548,24 @@ pub fn run_verified(
                 "frozen outbound prompt differs from preview; not sent",
             ));
         }
-        execute(&mut cmd, &input, config.provider, |activity| {
+        execute(&mut cmd, &input, config.provider, scope, |activity| {
             store.progress(run, activity).map_err(io::Error::other)
         })
     })();
     match result {
-        Ok(report) => store.finish_run(run, "review", &report)?,
+        Ok(output) => {
+            if let Err(e) =
+                store.finish_run_scoped(run, "review", &output.report, output.session_id.as_deref())
+            {
+                // A failed binding must not leave the task locked in running.
+                store.finish_run(
+                    run,
+                    "failed",
+                    "provider native session could not be associated; no automatic retry",
+                )?;
+                return Err(e.into());
+            }
+        }
         Err(error) => {
             store.finish_run(run, "failed", &error.to_string())?;
             return Err(error.into());
@@ -441,6 +579,8 @@ struct Stream {
     result: Option<String>,
     success: bool,
     error: bool,
+    session_id: Option<String>,
+    inconsistent_session: bool,
 }
 impl Stream {
     fn accept(&mut self, provider: Provider, v: &Value) -> Option<&'static str> {
@@ -448,6 +588,10 @@ impl Stream {
             (Provider::Codex, "thread.started") | (Provider::Claude, "system")
                 if matches!(provider, Provider::Codex) || v["subtype"] == "init" =>
             {
+                match provider {
+                    Provider::Codex => self.observe_session(v["thread_id"].as_str()),
+                    Provider::Claude => self.observe_session(v["session_id"].as_str()),
+                }
                 Some("connected")
             }
             (Provider::Codex, "turn.started") => Some("working"),
@@ -473,6 +617,7 @@ impl Stream {
                 Some(if reading { "reading" } else { "working" })
             }
             (Provider::Claude, "result") => {
+                self.observe_session(v["session_id"].as_str());
                 self.success = v["subtype"] == "success"
                     && v["is_error"] == false
                     && v["permission_denials"].as_array().is_none_or(Vec::is_empty);
@@ -483,6 +628,45 @@ impl Stream {
             _ => None,
         }
     }
+
+    fn observe_session(&mut self, id: Option<&str>) {
+        if let Some(id) = id {
+            if !sessions::valid_id(id)
+                || self.session_id.as_deref().is_some_and(|first| first != id)
+            {
+                self.inconsistent_session = true;
+            } else {
+                self.session_id = Some(id.to_owned());
+            }
+        }
+    }
+
+    fn confirmed_session(
+        &self,
+        scope: Option<sessions::Request<'_>>,
+    ) -> io::Result<Option<String>> {
+        let Some(request) = scope else {
+            return Ok(None);
+        };
+        let id = self.session_id.as_deref();
+        if self.inconsistent_session
+            || id.is_none()
+            || request
+                .expected
+                .is_some_and(|expected| id != Some(expected))
+        {
+            return Err(io::Error::other(
+                "provider did not confirm the exact native session; no automatic retry",
+            ));
+        }
+        Ok(self.session_id.clone())
+    }
+}
+
+#[derive(Debug)]
+struct ExecutionOutput {
+    report: String,
+    session_id: Option<String>,
 }
 
 fn clean(s: &str) -> String {
@@ -496,18 +680,27 @@ fn execute(
     cmd: &mut Command,
     input: &str,
     provider: Provider,
+    scope: Option<sessions::Request<'_>>,
     progress: impl FnMut(&str) -> io::Result<()>,
-) -> io::Result<String> {
-    execute_with_timeout(cmd, input, provider, Duration::from_secs(600), progress)
+) -> io::Result<ExecutionOutput> {
+    execute_with_timeout(
+        cmd,
+        input,
+        provider,
+        scope,
+        Duration::from_secs(600),
+        progress,
+    )
 }
 
 fn execute_with_timeout(
     cmd: &mut Command,
     input: &str,
     provider: Provider,
+    scope: Option<sessions::Request<'_>>,
     timeout: Duration,
     mut progress: impl FnMut(&str) -> io::Result<()>,
-) -> io::Result<String> {
+) -> io::Result<ExecutionOutput> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -605,10 +798,12 @@ fn execute_with_timeout(
         writer
             .join()
             .map_err(|_| io::Error::other("could not write agent instructions"))??;
-        stream
+        let session_id = stream.confirmed_session(scope)?;
+        let report = stream
             .result
             .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| io::Error::other("agent returned no report"))
+            .ok_or_else(|| io::Error::other("agent returned no report"))?;
+        Ok(ExecutionOutput { report, session_id })
     })();
     if result.is_err() {
         #[cfg(unix)]
@@ -664,22 +859,172 @@ mod tests {
     #[test]
     fn provider_defaults_disable_file_tools_without_opt_in() {
         let exe = Path::new("/not-executed");
-        let codex = Provider::Codex.command(exe, None, false);
+        let codex = Provider::Codex.command(
+            exe,
+            None,
+            false,
+            Path::new("/fixture"),
+            SessionMode::Ephemeral,
+            None,
+        );
         assert!(
             codex
                 .get_args()
                 .any(|arg| arg == "features.shell_tool=false")
         );
-        let claude = Provider::Claude.command(exe, None, false);
+        let claude = Provider::Claude.command(
+            exe,
+            None,
+            false,
+            Path::new("/fixture"),
+            SessionMode::Ephemeral,
+            None,
+        );
         let args = claude.get_args().collect::<Vec<_>>();
         let tools = args.iter().position(|arg| *arg == "--tools").unwrap();
         assert!(args[tools + 1].is_empty());
         assert!(
             Provider::Claude
-                .command(exe, None, true)
+                .command(
+                    exe,
+                    None,
+                    true,
+                    Path::new("/fixture"),
+                    SessionMode::Ephemeral,
+                    None
+                )
                 .get_args()
                 .any(|arg| arg == "Read,Glob,Grep")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confirmed_dispatch_resumes_only_the_bound_provider_uuid() {
+        use crate::store::Sqlite;
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "lazygtd-native-fixture-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let native = "01892af6-8270-7ced-86c1-929b50dadcb5";
+        let wrong = "361bf867-7c96-4097-9b3f-01cc00f12629";
+        for (provider, resume_key, events) in [
+            (
+                "codex",
+                "resume",
+                format!(
+                    "{{\"type\":\"thread.started\",\"thread_id\":\"{native}\"}}\n{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"fixture\"}}}}\n{{\"type\":\"turn.completed\"}}"
+                ),
+            ),
+            (
+                "claude",
+                "--resume",
+                format!(
+                    "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{native}\"}}\n{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"fixture\",\"session_id\":\"{native}\"}}"
+                ),
+            ),
+        ] {
+            let workspace = root.join(provider);
+            fs::create_dir(&workspace).unwrap();
+            let exe = root.join(format!("{provider}-fixture"));
+            fs::write(
+                &exe,
+                format!(
+                    "#!/bin/sh\nset -eu\n[ -z \"${{OPENAI_API_KEY:-}}\" ] && [ -z \"${{ANTHROPIC_API_KEY:-}}\" ]\ncase \" $* \" in *' --last '*|*' --continue '*|*' --ephemeral '*|*' --no-session-persistence '*) exit 2;; esac\ncase \" $* \" in *' {resume_key} '*) case \" $* \" in *' {resume_key} {native} '*|*' {resume_key} {wrong} '*) ;; *) exit 3;; esac ;; esac\ncat >/dev/null\ncat <<'EOF'\n{events}\nEOF\n"
+                )
+            ).unwrap();
+            fs::set_permissions(&exe, fs::Permissions::from_mode(0o700)).unwrap();
+            let config_path = root.join("agent.json");
+            let mut cfg = json!({
+                "provider": provider, "executable": exe, "workspace": workspace,
+                "session_mode": "persist"
+            });
+            fs::write(&config_path, cfg.to_string()).unwrap();
+            let mut db = Sqlite::open(&root.join(format!("{provider}.db"))).unwrap();
+            let item = db.add_with_body("synthetic", "", "user").unwrap();
+            let item = db
+                .send_message(item.id, item.revision, "first task-only prompt")
+                .unwrap();
+            let result = run_verified(
+                &mut db,
+                item.id,
+                item.revision,
+                &Config::load(&config_path).unwrap(),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(result.session_id.as_deref(), Some(native));
+
+            let item = db.show(item.id).unwrap();
+            let item = db
+                .send_message(item.id, item.revision, "next task-only prompt")
+                .unwrap();
+            cfg["resume_session"] = json!(native);
+            fs::write(&config_path, cfg.to_string()).unwrap();
+            let config = Config::load(&config_path).unwrap();
+            assert!(config.history_warning().is_some());
+            assert!(config.destination().contains(native));
+            let command = config.command().unwrap();
+            let args = command.get_args().collect::<Vec<_>>();
+            assert!(args.windows(2).any(|args| args == [resume_key, native]));
+            assert!(!args.iter().any(|arg| matches!(
+                arg.to_str(),
+                Some("--last" | "--continue" | "--ephemeral" | "--no-session-persistence")
+            )));
+            assert_eq!(
+                run_verified(&mut db, item.id, item.revision, &config, None)
+                    .unwrap()
+                    .unwrap()
+                    .session_id
+                    .as_deref(),
+                Some(native)
+            );
+
+            let second = db.add_with_body("unrelated", "", "user").unwrap();
+            let second = db
+                .send_message(second.id, second.revision, "reject before spawn")
+                .unwrap();
+            assert!(
+                run_verified(&mut db, second.id, second.revision, &config, None)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("another task or workspace")
+            );
+            assert!(db.latest_run(second.id).unwrap().is_none());
+
+            cfg["resume_session"] = json!(wrong);
+            fs::write(&config_path, cfg.to_string()).unwrap();
+            let item = db.show(item.id).unwrap();
+            let item = db
+                .send_message(item.id, item.revision, "mismatched result must fail")
+                .unwrap();
+            let err = run_verified(
+                &mut db,
+                item.id,
+                item.revision,
+                &Config::load(&config_path).unwrap(),
+                None,
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("exact native session"));
+            let run = db.latest_run(item.id).unwrap().unwrap();
+            assert_eq!(run.state, "failed");
+            assert_eq!(run.session_id, None);
+        }
     }
 
     #[cfg(unix)]
@@ -690,6 +1035,7 @@ mod tests {
             Command::new("/bin/sh").args(["-c", "sleep 5"]),
             "synthetic fixture only",
             Provider::Codex,
+            None,
             Duration::from_millis(100),
             |_| Ok(()),
         )

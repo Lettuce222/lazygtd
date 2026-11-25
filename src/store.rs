@@ -114,9 +114,33 @@ pub trait Store {
     fn answer(&mut self, id: i64, answer: questions::Answer<'_>, now: i64)
     -> questions::Result<()>;
     fn latest_run(&self, id: i64) -> Result<Option<AgentRun>>;
-    fn start_run(&mut self, id: i64, rev: i64, provider: &str) -> Result<i64>;
+    fn start_run(&mut self, id: i64, rev: i64, provider: &str) -> Result<i64> {
+        self.start_run_scoped(id, rev, provider, None)
+    }
+    fn start_run_scoped(
+        &mut self,
+        id: i64,
+        rev: i64,
+        provider: &str,
+        scope: Option<crate::sessions::Request<'_>>,
+    ) -> Result<i64>;
+    fn check_session(
+        &self,
+        id: i64,
+        provider: &str,
+        scope: crate::sessions::Request<'_>,
+    ) -> Result<()>;
     fn progress(&mut self, run: i64, event: &str) -> Result<()>;
-    fn finish_run(&mut self, run: i64, state: &str, result: &str) -> Result<()>;
+    fn finish_run(&mut self, run: i64, state: &str, result: &str) -> Result<()> {
+        self.finish_run_scoped(run, state, result, None)
+    }
+    fn finish_run_scoped(
+        &mut self,
+        run: i64,
+        state: &str,
+        result: &str,
+        native_session: Option<&str>,
+    ) -> Result<()>;
 }
 
 pub struct Sqlite(Connection);
@@ -131,6 +155,7 @@ pub struct AgentRun {
     pub result: String,
     pub started_at: String,
     pub finished_at: Option<String>,
+    pub session_id: Option<String>,
 }
 
 const V2: &str = "
@@ -435,7 +460,7 @@ impl Sqlite {
                 tx.execute_batch(SCHEMA)?;
                 tx.pragma_update(None, "application_id", APP_ID)?;
             }
-            (APP_ID, 1..=5) => {}
+            (APP_ID, 1..=6) => {}
             _ => {
                 return Err(StoreError::Invalid(
                     "database is not a supported lazygtd schema",
@@ -454,7 +479,10 @@ impl Sqlite {
         if ver < 5 {
             tx.execute_batch(planning::SCHEMA)?;
             tx.execute_batch(questions::SCHEMA)?;
-            tx.pragma_update(None, "user_version", 5)?;
+        }
+        if ver < 6 {
+            tx.execute_batch(crate::sessions::SCHEMA)?;
+            tx.pragma_update(None, "user_version", 6)?;
         }
         tx.commit()?;
         if file {
@@ -826,8 +854,10 @@ impl Store for Sqlite {
         let Some(urls) = item.planning.watch.as_deref().filter(|s| !s.is_empty()) else {
             return Err(StoreError::Invalid("no watch URLs on this item"));
         };
-        if item.box_id != "waiting" {
-            return Err(StoreError::Invalid("watch only applies to the waiting box"));
+        if item.done || item.box_id != "waiting" {
+            return Err(StoreError::Invalid(
+                "watch only applies to active items in the waiting box",
+            ));
         }
         if urls.split_whitespace().all(|url| closed.contains(&url)) {
             tx.execute(
@@ -921,13 +951,28 @@ impl Store for Sqlite {
         questions::answer(&self.0, id, answer, now)
     }
     fn latest_run(&self, id: i64) -> Result<Option<AgentRun>> {
-        Ok(self.0.query_row("SELECT id,item_revision,provider,state,activity,result,started_at,finished_at FROM agent_run WHERE item_id=? ORDER BY id DESC LIMIT 1", [id], |r| Ok(AgentRun {
+        Ok(self.0.query_row("SELECT a.id,a.item_revision,a.provider,a.state,a.activity,a.result,a.started_at,a.finished_at,s.native_session FROM agent_run a LEFT JOIN agent_session_run s ON s.run_id=a.id WHERE a.item_id=? ORDER BY a.id DESC LIMIT 1", [id], |r| Ok(AgentRun {
             id:r.get(0)?, item_revision:r.get(1)?, provider:r.get(2)?, state:r.get(3)?, activity:r.get(4)?,
-            result:r.get(5)?, started_at:r.get(6)?, finished_at:r.get(7)?,
+            result:r.get(5)?, started_at:r.get(6)?, finished_at:r.get(7)?, session_id:r.get(8)?,
         })).optional()?)
     }
 
-    fn start_run(&mut self, id: i64, rev: i64, provider: &str) -> Result<i64> {
+    fn check_session(
+        &self,
+        id: i64,
+        provider: &str,
+        scope: crate::sessions::Request<'_>,
+    ) -> Result<()> {
+        crate::sessions::check(&self.0, id, provider, scope)
+    }
+
+    fn start_run_scoped(
+        &mut self,
+        id: i64,
+        rev: i64,
+        provider: &str,
+        scope: Option<crate::sessions::Request<'_>>,
+    ) -> Result<i64> {
         let tx = self
             .0
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -941,6 +986,9 @@ impl Store for Sqlite {
         tx.execute("INSERT INTO agent_run(item_id,item_revision,provider,input,state) VALUES(?,?,?,?,'running')",
             params![id,rev,provider,input])?;
         let run = tx.last_insert_rowid();
+        if let Some(scope) = scope {
+            crate::sessions::reserve(&tx, run, id, provider, scope)?;
+        }
         talk::claim(&tx, id, run)?;
         tx.execute(
             "UPDATE item SET details=json_remove(details,'$.agent_review') WHERE id=?",
@@ -958,7 +1006,13 @@ impl Store for Sqlite {
         Ok(())
     }
 
-    fn finish_run(&mut self, run: i64, state: &str, result: &str) -> Result<()> {
+    fn finish_run_scoped(
+        &mut self,
+        run: i64,
+        state: &str,
+        result: &str,
+        native_session: Option<&str>,
+    ) -> Result<()> {
         if !["review", "failed"].contains(&state) {
             return Err(StoreError::Invalid("invalid terminal run status"));
         }
@@ -973,6 +1027,7 @@ impl Store for Sqlite {
             )
             .optional()?
             .ok_or(StoreError::Invalid("run is not active"))?;
+        crate::sessions::finish(&tx, run, state, native_session)?;
         tx.execute("UPDATE agent_run SET state=?,result=?,finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?", params![state,result,run])?;
         tx.execute(
             "UPDATE item SET assignee='me',box_id=CASE WHEN box_id='projects' THEN 'projects' ELSE 'review' END,revision=revision+1,
@@ -998,6 +1053,26 @@ impl Store for Sqlite {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v5_migration_preserves_tasks_and_agent_runs() {
+        let mut old = Sqlite::demo().unwrap();
+        let item = old
+            .add_with_body("migration fixture", "local body", "user")
+            .unwrap();
+        let item = old
+            .send_message(item.id, item.revision, "queued question")
+            .unwrap();
+        let run = old.start_run(item.id, item.revision, "demo").unwrap();
+        old.finish_run(run, "review", "local reply").unwrap();
+        old.0.execute_batch("DROP TABLE agent_session_run; DROP TABLE agent_session_binding; PRAGMA user_version=5;").unwrap();
+        let migrated = Sqlite::init(old.0, false).unwrap();
+        assert_eq!(migrated.show(item.id).unwrap().body, "local body");
+        let prior = migrated.latest_run(item.id).unwrap().unwrap();
+        assert_eq!(prior.result, "local reply");
+        assert!(prior.session_id.is_none());
+        assert_eq!(migrated.conversation(item.id).unwrap().len(), 2);
+    }
 
     #[test]
     fn injected_event_failure_rolls_back_mutation_and_revision() {

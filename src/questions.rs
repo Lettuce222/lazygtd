@@ -41,7 +41,7 @@ pub enum Kind {
 impl Kind {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Desk => "窓口の問い",
+            Self::Desk => "エージェントの問い",
             Self::Approval => "承認の問い",
             Self::Permission => "許可の確認",
             Self::Worker => "worker の問い",

@@ -16,6 +16,10 @@ Usage: lazygtd [--demo | --db PATH] [COMMAND]\n\
 No command: open TUI; --demo uses disposable in-memory data.
 \
 --agent-config PATH opens TUI with opt-in, confirmed remote dispatch.\n\
+--watch-github-curl /absolute/path/to/curl enables unauthenticated public PR checks while TUI runs.\n\
+--watch-github /absolute/path/to/gh uses an existing official GitHub CLI login instead.\n\
+--codex-review [--approved-note PATH] adds interactive Codex app-server review to --agent-config.\n\
+--claude-review shows live Claude questions/approval waits in Next Actions.\n\
 Commands: add TITLE [BODY] | edit-body ID REV BODY | list [--json] | show ID | move ID REV BOX | done ID REV\n\
 Agent: message ID REV TEXT | conversation ID | assign ID REV me|agent | instruct ID REV TEXT | agent-status ID\n\
        agent-preview ID CONFIG | agent-run ID REV CONFIG --send\n\
@@ -25,7 +29,7 @@ Plan: meta ID REV FIELD VALUE | steps PROJECT | step-add PROJECT REV TITLE [BODY
       step-order PROJECT REV ITEM... | watch-resolve ID REV CLOSED_URL...
 \
 Ask: questions [ID CHOICE] | question-import JSON | question-reply ID TEXT | question-reason ID TEXT\n\
-Boxes: review, desk, inbox, next, projects, waiting, someday, reference\n\
+Boxes: inbox, next, projects, waiting, someday, reference (review and desk are legacy IDs)\n\
 Options: --help, --version";
 
 enum Action<'a> {
@@ -41,7 +45,7 @@ enum Action<'a> {
     AnswerText(i64, bool, &'a str),
     Watch(i64, i64, Vec<&'a str>),
     Answer(i64, u8),
-    Tui(Option<&'a str>),
+    Tui(TuiOptions<'a>),
     Add(&'a str, &'a str),
     EditBody(i64, i64, &'a str),
     List(bool),
@@ -80,6 +84,69 @@ fn work_path() -> Result<PathBuf> {
     Ok(base.join("lazygtd").join("work.sqlite3"))
 }
 
+#[derive(Default)]
+struct TuiOptions<'a> {
+    agent: Option<&'a str>,
+    gh: Option<&'a str>,
+    curl: Option<&'a str>,
+    review: Option<crate::review_agent::Provider>,
+    note: Option<&'a str>,
+}
+
+fn open_tui<'a>(mut flags: &[&'a str], demo: bool) -> Result<Action<'a>> {
+    if demo && !flags.is_empty() {
+        return Err("external integrations are not available in demo".into());
+    }
+    let mut options = TuiOptions::default();
+    while !flags.is_empty() {
+        flags = match flags {
+            ["--agent-config", value, rest @ ..] if options.agent.is_none() => {
+                options.agent = Some(value);
+                rest
+            }
+            ["--watch-github", value, rest @ ..]
+                if options.gh.is_none() && options.curl.is_none() =>
+            {
+                options.gh = Some(value);
+                rest
+            }
+            ["--watch-github-curl", value, rest @ ..]
+                if options.gh.is_none() && options.curl.is_none() =>
+            {
+                options.curl = Some(value);
+                rest
+            }
+            [flag @ ("--codex-review" | "--claude-review"), rest @ ..]
+                if options.review.is_none() =>
+            {
+                use crate::review_agent::Provider;
+                options.review = Some(if *flag == "--codex-review" {
+                    Provider::Codex
+                } else {
+                    Provider::Claude
+                });
+                rest
+            }
+            ["--approved-note", value, rest @ ..] if options.note.is_none() => {
+                options.note = Some(value);
+                rest
+            }
+            _ => return Err("invalid or duplicate TUI options; see --help".into()),
+        };
+    }
+    if (options.review.is_some() && options.agent.is_none())
+        || (options.note.is_some() && options.review != Some(crate::review_agent::Provider::Codex))
+    {
+        return Err(
+            "review requires --agent-config; --approved-note requires --codex-review".into(),
+        );
+    }
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Err("the TUI requires an interactive terminal; use --help for CLI commands".into());
+    }
+    Ok(Action::Tui(options))
+}
+
 pub fn run(args: &[OsString]) -> Result<()> {
     if matches!(args, [arg] if arg == "--help" || arg == "-h") {
         println!("{USAGE}");
@@ -107,20 +174,16 @@ pub fn run(args: &[OsString]) -> Result<()> {
         .map(|a| a.to_str().ok_or("command arguments must be valid UTF-8"))
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let action = match rest.as_slice() {
-        [] => {
-            if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-                return Err(
-                    "the TUI requires an interactive terminal; use --help for CLI commands".into(),
-                );
-            }
-            Action::Tui(None)
-        }
-        ["--agent-config", path] if !demo => {
-            if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-                return Err("the TUI requires an interactive terminal".into());
-            }
-            Action::Tui(Some(path))
-        }
+        []
+        | [
+            "--agent-config"
+            | "--watch-github"
+            | "--watch-github-curl"
+            | "--codex-review"
+            | "--claude-review"
+            | "--approved-note",
+            ..,
+        ] => open_tui(&rest, demo)?,
         ["add", title] => Action::Add(title, ""),
         ["add", title, body] => Action::Add(title, body),
         ["edit-body", id, rev, body] => Action::EditBody(number(id)?, number(rev)?, body),
@@ -207,11 +270,32 @@ pub fn run(args: &[OsString]) -> Result<()> {
         store
     };
     match action {
-        Action::Tui(config) => {
-            let config = config
+        Action::Tui(options) => {
+            let config = options
+                .agent
                 .map(|p| crate::agent::Config::load(std::path::Path::new(p)))
                 .transpose()?;
-            crate::tui(Box::new(store), demo, profile_path, config)?;
+            let watcher = match (options.gh, options.curl) {
+                (Some(gh), None) => Some(crate::pr_watch::Watcher::new(std::path::Path::new(gh))?),
+                (None, Some(curl)) => Some(crate::pr_watch::Watcher::new_curl(
+                    std::path::Path::new(curl),
+                )?),
+                (None, None) => None,
+                _ => return Err("choose exactly one GitHub watch transport".into()),
+            };
+            let review = if let Some(provider) = options.review {
+                let config = config
+                    .as_ref()
+                    .ok_or("missing review agent configuration")?;
+                Some(crate::review_agent::Settings::new(
+                    config,
+                    provider,
+                    options.note.map(std::path::Path::new),
+                )?)
+            } else {
+                None
+            };
+            crate::tui(Box::new(store), demo, profile_path, config, watcher, review)?;
         }
         Action::Add(title, body) => println!(
             "{}",
