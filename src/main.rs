@@ -12,6 +12,7 @@ mod review_agent;
 mod sessions;
 mod store;
 mod talk;
+mod update;
 
 #[cfg(test)]
 use store::Sqlite;
@@ -1492,6 +1493,41 @@ fn popup(f: &mut Frame, area: Rect, title: &str, body: String, height: u16) {
             .wrap(Wrap { trim: false }),
         rect,
     );
+}
+
+fn confirm_update(version: &semver::Version) -> io::Result<bool> {
+    let mut terminal = ratatui::try_init()?;
+    let result = (|| loop {
+        terminal.draw(|frame| {
+            popup(
+                frame,
+                frame.area(),
+                "lazygtd の更新",
+                format!(
+                    "新しいバージョン {version} が利用できます。\n\n[y] 更新して起動   [n / Esc] このまま起動"
+                ),
+                frame.area().height.min(6),
+            );
+        })?;
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match key.code {
+            KeyCode::Char('y' | 'Y') => return Ok(true),
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => return Ok(false),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "終了しました"));
+            }
+            _ => {}
+        }
+    })();
+    let restored = ratatui::try_restore();
+    let confirmed = result?;
+    restored?;
+    Ok(confirmed)
 }
 
 fn tui(

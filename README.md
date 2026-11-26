@@ -24,6 +24,14 @@ Linux/WSL, or `shasum -a 256 PATH` on macOS. Run `./lazygtd --demo` on
 Linux/macOS or `.\lazygtd.exe --demo` in PowerShell. Release binaries are
 not signed or notarized; checksums do not override platform trust prompts.
 
+Run `lazygtd update` to install the newest published release, including
+previews. When opening the interactive TUI, lazygtd checks for a newer
+release. Press `y` to update and reopen the TUI with the same arguments, or
+`n` to continue. The update verifies the release archive against
+`SHA256SUMS` and replaces the executable in its current location. An
+unavailable update check leaves the TUI available offline. The demonstration
+and ordinary data commands run without an update check.
+
 ## Profiles and commands
 
 - `--demo` loads 46 synthetic Japanese sample tasks covering six visible boxes into an in-memory SQLite database.
@@ -83,13 +91,14 @@ cargo build --release --locked
 ```
 
 The build compiles the bundled C SQLite sources with the developer/CI
-toolchain; this is not a user-side dependency. To release, bump the version
-in `Cargo.toml` and `Cargo.lock` and merge into `main`. The workflow publishes
-only when that version exceeds every published release, and only after lint
-and the full platform matrix pass. It creates the version tag at the tested
-commit; a `-preview.N` version is published as a prerelease. Same-version
-changes and pull requests run CI without publishing. Use **Run workflow** on
-`main` to retry an unpublished version. The release includes
+toolchain; this is not a user-side dependency. Each push to `main` queues a
+build of that commit. The workflow allocates the next version, stamps the
+build with it and publishes after lint and the platform matrix pass. It
+tags the tested commit, incrementing the preview number or stable patch
+version within the current series. To start a new series, raise the base
+version in `Cargo.toml` and `Cargo.lock`. Pull requests run CI without
+publishing. Use **Run workflow** on `main` to retry an unpublished build.
+The release includes
 SHA256SUMS, bundled notices and GitHub build provenance, not OS signatures. When the native Apple Silicon runner is unavailable, the ARM Mac binary is cross-compiled and architecture-checked on Intel macOS, not runtime-tested on Apple Silicon. The previous Go implementation is [in dotfiles history](https://github.com/Lettuce222/dotfiles/tree/322bea95fea96e491cc1c742e32a92c231c5b61f/tools/lazygtd).
 
 ### Agent handoff (preview)

@@ -41,6 +41,7 @@ Body: --body-file PATH or --body - (standard input) for add, edit-body, step-add
 Writes: --by NAME records the change as agent:NAME. -- ends options.\n\
 Ask: questions [ID CHOICE] | question-import JSON | question-reply ID TEXT | question-reason ID TEXT\n\
 Boxes: inbox, next, projects, waiting, someday, reference (review and desk are legacy IDs)\n\
+Maintenance: update installs the latest published lazygtd release.\n\
 Options: --help, --version";
 
 /// Upper bound for a body read from a file or standard input; the store's own
@@ -418,6 +419,9 @@ pub fn run(args: &[OsString]) -> Result<()> {
         println!("lazygtd {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    if matches!(args, [arg] if arg == "update") {
+        return crate::update::run();
+    }
     let mut demo = false;
     let mut db = None;
     let rest = match args {
@@ -452,6 +456,18 @@ pub fn run(args: &[OsString]) -> Result<()> {
         parse(&rest, demo)?
     };
     let actor = actor.as_str();
+
+    if matches!(action, Action::Tui(_))
+        && !demo
+        && let Ok(Some(version)) = crate::update::available()
+        && crate::confirm_update(&version)?
+    {
+        eprintln!("lazygtd: {version} に更新しています…");
+        match crate::update::install(&version) {
+            Ok(executable) => return crate::update::restart(&executable, args),
+            Err(error) => eprintln!("lazygtd: 更新できませんでした: {error}"),
+        }
+    }
 
     let mut profile_path = None;
     let mut store = if demo {

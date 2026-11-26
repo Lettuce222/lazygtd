@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: build-${{ github.ref }}
-  cancel-in-progress: false
+  queue: max
 
 jobs:
   release-plan:
@@ -22,18 +22,21 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
       - name: Resolve the Cargo version
         run: cargo metadata --locked --no-deps --format-version 1 > cargo-metadata.json
-      - name: Plan a release only for a new version
+      - name: Allocate the release tag for this main commit
         id: version
         env:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq '.[] | select(.draft == false) | .tag_name' > published-tags
-          tag=$(python3 .github/scripts/release_plan.py cargo-metadata.json published-tags)
+          git for-each-ref --format='%(refname:short)%09%(objectname)%09%(*objectname)' refs/tags > tag-refs
+          tag=$(python3 .github/scripts/release_plan.py plan cargo-metadata.json published-tags tag-refs "$RELEASE_SHA")
           printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
 
   lint:
@@ -48,6 +51,7 @@ jobs:
           rustup component add rustfmt clippy
           cargo fmt --all -- --check
           cargo clippy --locked --all-targets -- -D warnings
+          python3 -m unittest discover -s .github/scripts -p test_release_plan.py
 
   build:
     needs: [release-plan]
@@ -85,6 +89,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Stamp the allocated Cargo version
+        if: needs.release-plan.outputs.tag != ''
+        shell: bash
+        run: python .github/scripts/release_plan.py stamp "$TAG"
       - name: Test and build native Unix
         if: runner.os != 'Windows' && matrix.platform != 'macos-arm64'
         shell: bash
