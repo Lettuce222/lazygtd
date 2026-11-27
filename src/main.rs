@@ -1399,11 +1399,9 @@ n / Esc: 拒否　c: 実行を中断")
             Mode::SendConfirm(_,prompt)=>{
                 let destination=self.agent_config.as_ref().map_or_else(String::new,agent::Config::destination);
                 let scope=if self.review_settings.as_ref().is_some_and(|s| s.note.is_some()) {
-                    "ファイル読み取り: 無効を要求。指定メモは別の確認が必要"
-                } else if self.agent_config.as_ref().is_some_and(agent::Config::allow_file_reads) {
-                    "CLIのファイル読み取り: 有効"
+                    "ファイル読み取り: 無効を要求。指定メモは別の確認が必要".into()
                 } else {
-                    "CLIのファイル読み取り: 無効を要求"
+                    self.agent_config.as_ref().map_or_else(String::new, agent::Config::launch_summary)
                 };
                 let history = self.agent_config.as_ref().and_then(agent::Config::history_warning).unwrap_or("");
                 let review = self.review_settings.as_ref().map_or_else(String::new, |s| format!("\n{}（対話確認つき）", s.provider.label()));
@@ -1923,5 +1921,58 @@ mod tests {
                 .iter()
                 .any(|item| item.title == "quote")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn send_confirmation_announces_a_trusted_launch_and_its_rules_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "lazygtd-trusted-confirm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let workspace = root.join("ws");
+        std::fs::create_dir(&workspace).unwrap();
+        let exe = root.join("claude");
+        std::fs::write(&exe, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let rules = root.join("r.md");
+        std::fs::write(&rules, "- synthetic\n").unwrap();
+        std::fs::set_permissions(&rules, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let config_path = root.join("agent.json");
+        let screen = |config: serde_json::Value| {
+            std::fs::write(&config_path, config.to_string()).unwrap();
+            let mut desk = Desk::demo();
+            desk.demo = false;
+            desk.agent_config = Some(agent::Config::load(&config_path).unwrap());
+            let item = desk.store.list().unwrap().remove(0);
+            desk.mode = Mode::SendConfirm(item, "synthetic prompt".into());
+            view(&mut desk, 100, 44).concat().replace(' ', "")
+        };
+        let base = serde_json::json!({"provider":"claude","executable":exe,"workspace":workspace});
+        let readonly = screen(base.clone());
+        assert!(readonly.contains("ファイル読み取り"), "{readonly}");
+        assert!(!readonly.contains("信頼する起動"));
+        let mut trusted = base;
+        trusted["mode"] = "trusted".into();
+        trusted["rules_file"] = serde_json::json!(rules);
+        let shown = screen(trusted);
+        let _ = std::fs::remove_dir_all(&root);
+        for expected in [
+            "(trusted)",
+            "信頼する起動",
+            "読む設定",
+            "--permission-modedefault",
+            "決まりのファイル",
+            "y:この内容で送信",
+        ] {
+            assert!(shown.contains(expected), "{expected}");
+        }
     }
 }

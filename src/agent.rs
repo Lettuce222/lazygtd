@@ -33,18 +33,11 @@ impl Provider {
         }
     }
 
-    fn command(
-        self,
-        executable: &Path,
-        model: Option<&str>,
-        allow_file_reads: bool,
-        workspace: &Path,
-        session_mode: SessionMode,
-        resume: Option<&str>,
-    ) -> Command {
+    fn command(self, executable: &Path, launch: &Launch<'_>) -> Command {
         let mut cmd = Command::new(executable);
-        match self {
-            Self::Codex => cmd.args([
+        let trusted = launch.mode == LaunchMode::Trusted;
+        match (self, trusted) {
+            (Self::Codex, false) => cmd.args([
                 "-a",
                 "never",
                 "exec",
@@ -82,7 +75,16 @@ impl Provider {
                 "--color",
                 "never",
             ]),
-            Self::Claude => cmd.args([
+            // Trusted launches read the user's normal configuration. Only the
+            // protocol flags lazygtd needs to read the result are fixed.
+            (Self::Codex, true) => cmd.args([
+                "exec",
+                "--json",
+                "--skip-git-repo-check",
+                "--color",
+                "never",
+            ]),
+            (Self::Claude, false) => cmd.args([
                 "-p",
                 "--verbose",
                 "--safe-mode",
@@ -93,7 +95,7 @@ impl Provider {
                 "--setting-sources",
                 "",
                 "--tools",
-                if allow_file_reads {
+                if launch.allow_file_reads {
                     "Read,Glob,Grep"
                 } else {
                     ""
@@ -104,8 +106,16 @@ impl Provider {
                 "--disallowedTools",
                 "mcp__*",
             ]),
+            (Self::Claude, true) => cmd.args([
+                "-p",
+                "--verbose",
+                "--output-format",
+                "stream-json",
+                "--permission-mode",
+                launch.permission_mode.unwrap_or("default"),
+            ]),
         };
-        if matches!(self, Self::Codex) && !allow_file_reads {
+        if matches!(self, Self::Codex) && !trusted && !launch.allow_file_reads {
             cmd.args([
                 "-c",
                 "features.shell_tool=false",
@@ -113,28 +123,62 @@ impl Provider {
                 "features.view_image=false",
             ]);
         }
-        if let Some(model) = model {
+        if trusted {
+            match self {
+                Self::Codex => {
+                    if let Some(sandbox) = launch.permission_mode {
+                        cmd.args(["--sandbox", sandbox]);
+                    }
+                }
+                Self::Claude => {
+                    if let Some(rules) = launch.rules_file {
+                        cmd.arg("--append-system-prompt-file").arg(rules);
+                    }
+                }
+            }
+        }
+        if let Some(model) = launch.model {
             cmd.args(["--model", model]);
         }
         if matches!(self, Self::Codex) {
             // The resume command otherwise inherits the previous workspace.
-            cmd.arg("-C").arg(workspace);
-            if session_mode == SessionMode::Ephemeral {
+            cmd.arg("-C").arg(launch.workspace);
+            if launch.session_mode == SessionMode::Ephemeral {
                 cmd.arg("--ephemeral");
             }
-            if let Some(id) = resume {
+            if let Some(id) = launch.resume {
                 cmd.args(["resume", id]);
             }
             cmd.arg("-");
         } else {
-            if session_mode == SessionMode::Ephemeral {
+            if launch.session_mode == SessionMode::Ephemeral {
                 cmd.arg("--no-session-persistence");
             }
-            if let Some(id) = resume {
+            if let Some(id) = launch.resume {
                 cmd.args(["--resume", id]);
             }
         }
         cmd
+    }
+
+    /// Permission modes a trusted launch may request. Modes that skip the
+    /// CLI's own permission checks entirely are not offered.
+    fn permission_modes(self) -> &'static [&'static str] {
+        match self {
+            Self::Codex => &["read-only", "workspace-write"],
+            Self::Claude => &["default", "acceptEdits", "plan", "auto", "dontAsk"],
+        }
+    }
+
+    fn settings_read(self) -> &'static str {
+        match self {
+            Self::Codex => {
+                "CLIの既定（ユーザーとプロジェクトのconfig.toml、hooks、MCP、スキル、AGENTS.md）"
+            }
+            Self::Claude => {
+                "CLIの既定（ユーザー・プロジェクト・ローカルのsettings、hooks、MCP、スキル、CLAUDE.md）"
+            }
+        }
     }
 
     fn credential_name(self) -> &'static str {
@@ -153,6 +197,29 @@ enum SessionMode {
     Persist,
 }
 
+/// How much of the user's own CLI setup a launch uses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum LaunchMode {
+    /// Read-only tools, no user hooks/MCP/skills, narrowed environment.
+    #[default]
+    Readonly,
+    /// The official CLI with the user's normal settings. What it may write,
+    /// push or post is decided by those settings, not by lazygtd.
+    Trusted,
+}
+
+struct Launch<'a> {
+    mode: LaunchMode,
+    model: Option<&'a str>,
+    allow_file_reads: bool,
+    permission_mode: Option<&'a str>,
+    rules_file: Option<&'a Path>,
+    workspace: &'a Path,
+    session_mode: SessionMode,
+    resume: Option<&'a str>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
@@ -161,7 +228,13 @@ struct ConfigFile {
     workspace: PathBuf,
     model: Option<String>,
     #[serde(default)]
+    mode: LaunchMode,
+    #[serde(default)]
     allow_file_reads: bool,
+    permission_mode: Option<String>,
+    rules_file: Option<PathBuf>,
+    #[serde(default)]
+    inherit_env: bool,
     #[serde(default)]
     session_mode: SessionMode,
     resume_session: Option<String>,
@@ -174,13 +247,49 @@ pub struct Config {
     executable_metadata: Metadata,
     workspace: PathBuf,
     model: Option<String>,
+    mode: LaunchMode,
     allow_file_reads: bool,
+    permission_mode: Option<String>,
+    rules_file: Option<PathBuf>,
+    inherit_env: bool,
     session_mode: SessionMode,
     resume_session: Option<String>,
 }
 
 const SESSION_WARNING: &str = "保存型: CLIの既定プロフィールに履歴を保存します。再開時は、今回の入力以外に以前の会話やツール出力も送信対象になり得ます。";
 pub const TRUST_WARNING: &str = "実験機能: 公式CLIと信頼できる環境のみ。CLIや管理設定はプレビューにない情報を読み取り、送信できる場合があります。";
+pub const TRUSTED_WARNING: &str = "信頼する起動: あなたの普通の設定で公式CLIを起動します。書く・pushする・外に出す操作ができるかは、CLIの権限の設定とあなたのhooksで決まります。lazygtdは隔離しません。";
+
+/// Accept a rules file only if it is a regular local file that nobody but
+/// its owner (the current user) can change.
+fn rules_file(path: &Path) -> Result<PathBuf> {
+    if !local_launch_path(path) {
+        return Err(
+            "rules_file must be an absolute local path without display control characters".into(),
+        );
+    }
+    let path = path.canonicalize()?;
+    if !local_launch_path(&path) {
+        return Err("rules_file resolves to an unsafe or non-local path".into());
+    }
+    let metadata = fs::metadata(&path)?;
+    if !metadata.is_file() {
+        return Err("rules_file must be a regular file".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        unsafe extern "C" {
+            fn geteuid() -> u32;
+        }
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let uid = unsafe { geteuid() };
+        if metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
+            return Err("rules_file must be owned by you and not writable by group or other users (chmod go-w)".into());
+        }
+    }
+    Ok(path)
+}
 
 fn display_safe(path: &Path) -> bool {
     !path.to_string_lossy().chars().any(|c| {
@@ -283,8 +392,9 @@ fn controlled_env(
 impl Config {
     pub fn destination(&self) -> String {
         format!(
-            "{} / {} / {} / {}{}",
+            "{}{} / {} / {} / {}{}",
             self.provider.name(),
+            if self.trusted() { " (trusted)" } else { "" },
             self.model.as_deref().unwrap_or("default model"),
             self.workspace.display(),
             self.executable.display(),
@@ -301,6 +411,47 @@ impl Config {
 
     pub fn allow_file_reads(&self) -> bool {
         self.allow_file_reads
+    }
+
+    pub fn trusted(&self) -> bool {
+        self.mode == LaunchMode::Trusted
+    }
+
+    fn mode_name(&self) -> &'static str {
+        if self.trusted() {
+            "trusted"
+        } else {
+            "read-only"
+        }
+    }
+
+    /// Lines shown before every launch: the preview, the TUI confirmation and
+    /// `agent-preview` all use this, so a trusted launch is never silent.
+    pub fn launch_summary(&self) -> String {
+        if !self.trusted() {
+            return if self.allow_file_reads {
+                "CLIのファイル読み取り: 有効".into()
+            } else {
+                "CLIのファイル読み取り: 無効を要求".into()
+            };
+        }
+        let permission = match (self.provider, self.permission_mode.as_deref()) {
+            (Provider::Claude, mode) => format!("--permission-mode {}", mode.unwrap_or("default")),
+            (Provider::Codex, Some(mode)) => format!("--sandbox {mode}"),
+            (Provider::Codex, None) => "CLIの設定のまま".into(),
+        };
+        format!(
+            "{TRUSTED_WARNING}\n読む設定: {}\n権限: {permission}\n決まりのファイル: {}\n環境変数: {}",
+            self.provider.settings_read(),
+            self.rules_file
+                .as_ref()
+                .map_or_else(|| "無し".into(), |path| path.display().to_string()),
+            if self.inherit_env {
+                "起動した端末のものをすべて引き継ぐ"
+            } else {
+                "絞って渡す"
+            },
+        )
     }
 
     pub fn history_warning(&self) -> Option<&'static str> {
@@ -357,13 +508,48 @@ impl Config {
         }
         let executable = config.executable.canonicalize()?;
         let executable_metadata = executable_metadata(&executable)?;
+        match config.mode {
+            LaunchMode::Readonly => {
+                if config.permission_mode.is_some()
+                    || config.rules_file.is_some()
+                    || config.inherit_env
+                {
+                    return Err(
+                        "permission_mode, rules_file and inherit_env require mode: trusted".into(),
+                    );
+                }
+            }
+            LaunchMode::Trusted => {
+                if config.allow_file_reads {
+                    return Err("allow_file_reads applies to read-only mode; trusted tools follow your CLI settings".into());
+                }
+                if let Some(mode) = &config.permission_mode
+                    && !config.provider.permission_modes().contains(&mode.as_str())
+                {
+                    return Err(format!(
+                        "permission_mode for {} must be one of: {}",
+                        config.provider.name(),
+                        config.provider.permission_modes().join(", ")
+                    )
+                    .into());
+                }
+                if config.rules_file.is_some() && matches!(config.provider, Provider::Codex) {
+                    return Err("rules_file is supported for claude only; put Codex rules in AGENTS.md or your Codex config".into());
+                }
+            }
+        }
+        let rules_file = config.rules_file.as_deref().map(rules_file).transpose()?;
         let config = Self {
             provider: config.provider,
             executable,
             executable_metadata,
             workspace,
             model: config.model,
+            mode: config.mode,
             allow_file_reads: config.allow_file_reads,
+            permission_mode: config.permission_mode,
+            rules_file,
+            inherit_env: config.inherit_env,
             session_mode: config.session_mode,
             resume_session: config.resume_session,
         };
@@ -398,6 +584,11 @@ impl Config {
         if changed {
             return Err("agent executable changed; review the configuration again".into());
         }
+        if let Some(path) = &self.rules_file
+            && rules_file(path)? != *path
+        {
+            return Err("rules_file changed; review the configuration again".into());
+        }
         // Codex's ignore-user-config does not disable project settings. Reject
         // project config discovery rather than attempt to filter config keys.
         let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
@@ -412,7 +603,8 @@ impl Config {
                     .into(),
             );
         }
-        if matches!(self.provider, Provider::Codex) {
+        // A trusted launch reads project config on purpose.
+        if matches!(self.provider, Provider::Codex) && !self.trusted() {
             for dir in self.workspace.ancestors() {
                 // This exact home file is the user config already excluded
                 // by --ignore-user-config. No custom CODEX_HOME is inherited.
@@ -442,9 +634,9 @@ impl Config {
         if self.provider.name() != selected {
             return Err("review option must match the configured provider".into());
         }
-        if self.session_mode != SessionMode::Ephemeral || self.allow_file_reads {
+        if self.session_mode != SessionMode::Ephemeral || self.allow_file_reads || self.trusted() {
             return Err(
-                "live review requires an ephemeral configuration with file tools disabled".into(),
+                "live review requires a read-only, ephemeral configuration with file tools disabled".into(),
             );
         }
         self.verify_launch_paths()?;
@@ -464,26 +656,38 @@ impl Config {
 
     fn command(&self) -> Result<Command> {
         self.verify_launch_paths()?;
-        let mut cmd = self.provider.command(
-            &self.executable,
-            self.model.as_deref(),
-            self.allow_file_reads,
-            &self.workspace,
-            self.session_mode,
-            self.resume_session.as_deref(),
-        );
+        let mut cmd = self.provider.command(&self.executable, &self.launch());
         // A persisted conversation uses the native CLI’s existing profile,
         // not a possibly unrelated API key inherited from the calling shell.
-        // No custom profile directory is inherited in either mode.
-        cmd.env_clear()
-            .envs(controlled_env(self.provider, |name| {
-                (self.session_mode == SessionMode::Ephemeral
-                    || name != self.provider.credential_name())
-                .then(|| env::var_os(name))
-                .flatten()
-            }))
-            .current_dir(&self.workspace);
+        // No custom profile directory is inherited unless the user asked a
+        // trusted launch to keep the whole environment.
+        let persisted = self.session_mode != SessionMode::Ephemeral;
+        if self.inherit_env {
+            if persisted {
+                cmd.env_remove(self.provider.credential_name());
+            }
+        } else {
+            cmd.env_clear().envs(controlled_env(self.provider, |name| {
+                (!persisted || name != self.provider.credential_name())
+                    .then(|| env::var_os(name))
+                    .flatten()
+            }));
+        }
+        cmd.current_dir(&self.workspace);
         Ok(cmd)
+    }
+
+    fn launch(&self) -> Launch<'_> {
+        Launch {
+            mode: self.mode,
+            model: self.model.as_deref(),
+            allow_file_reads: self.allow_file_reads,
+            permission_mode: self.permission_mode.as_deref(),
+            rules_file: self.rules_file.as_deref(),
+            workspace: &self.workspace,
+            session_mode: self.session_mode,
+            resume: self.resume_session.as_deref(),
+        }
     }
 }
 
@@ -498,7 +702,14 @@ pub fn preview(store: &dyn Store, id: i64, config: &Config) -> Result<()> {
             "provider": config.provider, "workspace": config.workspace, "model": config.model,
             "id": id, "revision": item.revision, "assignee": item.assignee, "prompt": store.agent_prompt(id)?,
             "executable": config.executable, "allow_file_reads": config.allow_file_reads(),
-            "mode": "read-only", "warning": TRUST_WARNING,
+            "mode": config.mode_name(), "warning": TRUST_WARNING,
+            "trusted_warning": config.trusted().then_some(TRUSTED_WARNING),
+            "settings": if config.trusted() { config.provider.settings_read() } else { "none (safe mode)" },
+            "permission_mode": config.trusted().then(|| config.permission_mode.as_deref().unwrap_or(match config.provider {
+                Provider::Claude => "default",
+                Provider::Codex => "cli config",
+            })),
+            "rules_file": config.rules_file, "inherit_env": config.inherit_env,
             "session_mode": config.session_mode, "resume_session": config.resume_session,
             "history_warning": config.history_warning()
         }))?
@@ -856,45 +1067,111 @@ mod tests {
         }
     }
 
+    fn launch(mode: LaunchMode, allow_file_reads: bool) -> Launch<'static> {
+        Launch {
+            mode,
+            model: None,
+            allow_file_reads,
+            permission_mode: None,
+            rules_file: None,
+            workspace: Path::new("/fixture"),
+            session_mode: SessionMode::Ephemeral,
+            resume: None,
+        }
+    }
+
+    fn args(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
     #[test]
     fn provider_defaults_disable_file_tools_without_opt_in() {
         let exe = Path::new("/not-executed");
-        let codex = Provider::Codex.command(
-            exe,
-            None,
-            false,
-            Path::new("/fixture"),
-            SessionMode::Ephemeral,
-            None,
-        );
+        let codex = Provider::Codex.command(exe, &launch(LaunchMode::Readonly, false));
         assert!(
-            codex
-                .get_args()
+            args(&codex)
+                .iter()
                 .any(|arg| arg == "features.shell_tool=false")
         );
-        let claude = Provider::Claude.command(
-            exe,
-            None,
-            false,
-            Path::new("/fixture"),
-            SessionMode::Ephemeral,
-            None,
-        );
-        let args = claude.get_args().collect::<Vec<_>>();
-        let tools = args.iter().position(|arg| *arg == "--tools").unwrap();
-        assert!(args[tools + 1].is_empty());
+        let claude = args(&Provider::Claude.command(exe, &launch(LaunchMode::Readonly, false)));
+        let tools = claude.iter().position(|arg| arg == "--tools").unwrap();
+        assert!(claude[tools + 1].is_empty());
         assert!(
-            Provider::Claude
-                .command(
-                    exe,
-                    None,
-                    true,
-                    Path::new("/fixture"),
-                    SessionMode::Ephemeral,
-                    None
-                )
-                .get_args()
+            args(&Provider::Claude.command(exe, &launch(LaunchMode::Readonly, true)))
+                .iter()
                 .any(|arg| arg == "Read,Glob,Grep")
+        );
+    }
+
+    #[test]
+    fn trusted_launch_drops_readonly_restrictions_and_passes_rules() {
+        let exe = Path::new("/not-executed");
+        let restrictions = [
+            "--safe-mode",
+            "--setting-sources",
+            "--tools",
+            "--strict-mcp-config",
+            "--mcp-config",
+            "--disallowedTools",
+            "--ignore-user-config",
+            "--disable",
+            "--sandbox",
+            "-a",
+            "-c",
+        ];
+        let mut trusted = launch(LaunchMode::Trusted, false);
+        let claude = args(&Provider::Claude.command(exe, &trusted));
+        assert!(
+            !claude
+                .iter()
+                .any(|arg| restrictions.contains(&arg.as_str()))
+        );
+        assert!(
+            claude
+                .windows(2)
+                .any(|w| w == ["--permission-mode", "default"])
+        );
+        assert!(
+            !claude
+                .iter()
+                .any(|arg| arg == "--append-system-prompt-file")
+        );
+        let codex = args(&Provider::Codex.command(exe, &trusted));
+        assert!(!codex.iter().any(|arg| restrictions.contains(&arg.as_str())));
+        assert_eq!(codex[..2], ["exec", "--json"]);
+
+        trusted.permission_mode = Some("acceptEdits");
+        trusted.rules_file = Some(Path::new("/fixture/rules.md"));
+        let claude = args(&Provider::Claude.command(exe, &trusted));
+        assert!(
+            claude
+                .windows(2)
+                .any(|w| w == ["--permission-mode", "acceptEdits"])
+        );
+        assert!(
+            claude
+                .windows(2)
+                .any(|w| w == ["--append-system-prompt-file", "/fixture/rules.md"])
+        );
+        trusted.permission_mode = Some("workspace-write");
+        trusted.rules_file = None;
+        let codex = args(&Provider::Codex.command(exe, &trusted));
+        assert!(
+            codex
+                .windows(2)
+                .any(|w| w == ["--sandbox", "workspace-write"])
+        );
+        assert!(
+            !Provider::Claude
+                .permission_modes()
+                .contains(&"bypassPermissions")
+        );
+        assert!(
+            !Provider::Codex
+                .permission_modes()
+                .contains(&"danger-full-access")
         );
     }
 

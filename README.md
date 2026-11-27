@@ -121,7 +121,8 @@ and authenticate the official tool separately; configure the absolute path to th
 account you are using. Use a trusted official CLI and workspace; the provider's own settings and
 capabilities are outside lazygtd's isolation boundary. File tools are not
 requested by default; `allow_file_reads: true` explicitly requests read-only
-file tools. Don't use this as a sandbox or send work data without authorization.
+file tools. `"mode": "trusted"` launches the CLI with your normal settings
+instead (see below). Don't use this as a sandbox or send work data without authorization.
 There is no automatic launch or credential registration.
 
 1. Set assignee and directions with TUI, or run `assign ID REV agent` and
@@ -142,17 +143,35 @@ at most one active run per task; the exit status and provider protocol
 determine the result. A report or failure makes the task visible in Next Actions under your responsibility. Fresh setup and existing v1–v6 databases use the same v7
 schema; older binaries cannot open a migrated database. See [storage design and spec progress](docs/spec-progress.md).
 
-These adapters are for read-only research/planning in a trusted workspace;
-they are not OS isolation for arbitrary or untrusted repositories. They
-request the provider's read-only tool restrictions, do not include write,
-push or external-post adapters, and do not bypass permission prompts.
+#### Two launch modes
+
+- **Read-only (default).** For research and planning in a trusted
+  workspace. lazygtd requests the provider's read-only tool restrictions,
+  does not load your hooks, MCP servers or skills, narrows the environment,
+  and does not bypass permission prompts. This is not OS isolation for
+  arbitrary or untrusted repositories.
+- **Trusted (explicit opt-in only).** For work that is more than reading:
+  implementation, pushing your own branch, or drafting text to post
+  elsewhere. lazygtd launches the official CLI with your normal settings, so
+  whether the agent can write, push or post is decided by the CLI's
+  permission settings and your own hooks, not by lazygtd. Only choose it
+  with a CLI configuration you already rely on to guard approvals and
+  outbound actions.
+
+In trusted mode lazygtd does not isolate the process, and the safeguards for
+approvals and outbound actions belong to your settings (hooks and similar).
+lazygtd's part is to make the choice visible: every preview and confirmation
+says that the launch is trusted, which settings the CLI will read, and which
+rules file is passed. Demo mode cannot use either mode. See
+[trusted launch](docs/trusted-launch.md).
+
 Optional integrations:
 - [Public GitHub PR monitoring](docs/pr-watch.md) while the TUI runs.
 - [Resume an exact Codex or Claude Code session](docs/agent-sessions.md).
-- [Live, narrowly scoped Codex and Claude review](docs/approvals.md).
+- [Live, narrowly scoped Codex and Claude review](docs/approvals.md) (read-only mode only).
 
-Actual worktree edits, general command approvals, unrestricted Claude approvals,
-always-on automation, and import from the old Hub are outside this scope. Real runs are foreground in the
+General command approvals from lazygtd itself, always-on automation, and
+import from the old Hub are outside this scope. Real runs are foreground in the
 launching terminal; a forced process shutdown may leave an active record
 that needs manual recovery. After verifying the worker really stopped, run
 `agent-recover ID RUN --confirmed-stopped`. This only repairs the local record,
